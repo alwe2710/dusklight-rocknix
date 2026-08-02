@@ -126,14 +126,35 @@ maps 1:1.
 The session that wrote this doc could not pull `ghcr.io/rocknix/rocknix-build` — its blob storage
 host (`pkg-containers.githubusercontent.com`) is blocked by that sandbox's egress policy (403,
 confirmed via the environment's own proxy diagnostics, which explicitly say to report rather than
-route around such blocks). Building a generic (non-ROCKNIX) aarch64 toolchain instead to at least
-smoke-test the CMake plumbing was considered and rejected: the brief is explicit that a
-non-matching glibc/kernel-header toolchain isn't an acceptable substitute, and partial validation
-against the wrong sysroot risks reporting false confidence. `CMakeLists.txt` itself has no
-ROCKNIX/Linux-variant-specific logic that would obviously break (checked: no unconditional X11
-requirement, no non-generic-Linux assumptions beyond the Wayland-is-already-on point above), so
-the cross-build is expected to mainly hit the "missing sysroot package" class of error described
-above — but that's an expectation, not a verified fact. Run section B yourself and fix forward.
+route around such blocks). `CMakeLists.txt` itself has no ROCKNIX/Linux-variant-specific logic
+that would obviously break (checked: no unconditional X11 requirement, no non-generic-Linux
+assumptions beyond the Wayland-is-already-on point above).
+
+A generic (non-ROCKNIX) `aarch64-linux-gnu` toolchain was used for a one-off smoke test of the
+*CMake plumbing only* — never as a stand-in for the real target, per the brief's explicit
+requirement for a glibc/kernel-header-matched toolchain. It's useful for what it found, not as
+build verification:
+
+- The toolchain-file mechanics themselves are sound: cross-compiler detection, `-mcpu` flags, and
+  `AURORA_DAWN_PROVIDER=package` all worked and correctly triggered the prebuilt `linux-aarch64`
+  Dawn package fetch.
+- Ubuntu's `gcc-*-aarch64-linux-gnu` cross packages and its `:arm64` multiarch dev packages
+  (`libasound2-dev:arm64` etc., needed to even approximate `docs/building.md`'s dependency list)
+  use two different, non-overlapping sysroot layouts (`/usr/aarch64-linux-gnu/` for the cross
+  packages vs. plain multiarch paths under `/usr/lib/aarch64-linux-gnu/` for the `:arm64`
+  packages) — `CMAKE_FIND_ROOT_PATH` can only point at one. This is exactly the class of problem a
+  single self-contained ROCKNIX-built sysroot avoids, and is itself a reason not to substitute a
+  generic toolchain even for local iteration.
+- Also hit a second blocked GitHub host distinct from the `ghcr.io` one: `codeload.github.com`
+  (`https://github.com/.../archive/refs/tags/...tar.gz`, used by several `FetchContent` deps
+  including abseil-cpp — note release-asset downloads via `objects.githubusercontent.com`, e.g.
+  the Dawn package itself, were reachable, just not archive-tarball downloads). Confirmed via
+  direct `curl`, not routed around, same as the `ghcr.io` block. This is a sandbox-only
+  restriction; a normal developer machine won't hit it.
+
+Net: the cross-build is expected to mainly hit the "missing sysroot package" class of error
+described above — but that's an expectation, not a verified fact for the *real* toolchain. Run
+section B yourself, with the real ROCKNIX-built toolchain, and fix forward from there.
 
 ## C. Graphics backend — empirical, not assumed
 
