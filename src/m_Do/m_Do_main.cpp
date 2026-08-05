@@ -6,6 +6,7 @@
 
 #include "m_Do/m_Do_main.h"
 #include <dolphin/vi.h>
+#include <cstdlib>
 #include <cstring>
 #include "DynamicLink.h"
 #include "JSystem/JAudio2/JASAudioThread.h"
@@ -646,6 +647,9 @@ int game_main(int argc, char* argv[]) {
         config.pauseOnFocusLost = dusk::getSettings().game.pauseOnFocusLost;
         config.imGuiInitCallback = &aurora_imgui_init_callback;
         config.allowTextureDumps = false;
+        // Dual-screen (ROCKNIX Anbernic RG DS) opt-in: set by platforms/rocknix/dusklight.sh, not
+        // a persisted setting, since it depends on running on a device with a second panel at all.
+        config.enableSecondWindow = std::getenv("DUSKLIGHT_DUAL_SCREEN") != nullptr;
         auroraInfo = aurora_initialize(argc, argv, &config);
     }
 

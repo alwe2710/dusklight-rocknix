@@ -1,14 +1,18 @@
 # Porting Dusklight to ROCKNIX (Anbernic RG DS)
 
-Status: Step 1 only — a native, standalone port running on the RG DS. Dual-screen support
-(second display, streaming, alternative layouts) is out of scope; do not start on it here.
+Status: Step 1 (native, standalone single-screen port) is done — see Sections A-D. Step 2
+(dual-screen: item HUD + minimap on the lower panel, no hide toggle) was explicitly requested and
+is in progress — see Section E. `docs/rocknix-porting.md` no longer reflects the original
+single-screen-only scope from the initial brief.
 
 Toolchain build and cross-build (Sections A/B) are done — a real `dusklight` aarch64 binary has
 been produced with the actual ROCKNIX-built toolchain, packaged per Section D below. Graphics
 backend (Section C) is verified on real RG DS hardware: Vulkan via `libmali` initializes cleanly and
-the game reaches the actual game loop. A separate, later-stage crash (disc archive mount, likely
-dump/IO-related, not a backend or platform issue) is the current blocker to a full playable boot —
-see Section C's result entry.
+the game reaches the actual game loop. A separate, later-stage crash (disc archive mount) is
+confirmed *not* disc-quality related (the same ISO plays fine via Dusklight on PC) — root cause is
+still open, see Section C's result entry for the diagnostic dead-end hit so far (an `OSReport`
+silencing flag that was masking the real allocation-failure diagnostics, now worked around for
+future debugging, but the underlying cause of the oversized allocation itself isn't found yet).
 
 This documents the cross-toolchain setup, cross-build, graphics-backend verification, and
 packaging needed to run Dusklight on ROCKNIX's RK3566 target (covers the RG DS; RK3568 dtb
@@ -285,12 +289,34 @@ above.
    >
    > This run got well past graphics/window init — SDL window, Vulkan adapter, Wayland surface, RmlUI
    > menu rendering, DVD image loading, and into the actual game loop — before hitting an unrelated
-   > crash (`JKRExpHeap` allocation failure while mounting the first disc archive; likely disc-dump
-   > integrity/IO, not a backend or platform issue — `mem1Size`/`mem2Size` in `m_Do_main.cpp` are
-   > identical across every platform this game builds for, not ROCKNIX-specific). That crash is a
-   > separate, later-stage issue tracked outside this doc's scope (Step 1 here is "does it boot and
-   > run," which as of Section B/C it now demonstrably does); Step 1 is not yet fully closed, but the
-   > platform/graphics-backend question this section exists to answer is resolved.
+   > crash (`JKRExpHeap` allocation failure while mounting the first disc archive). `mem1Size`/
+   > `mem2Size` in `m_Do_main.cpp` are identical across every platform this game builds for, not
+   > ROCKNIX-specific, so a platform-level cause was never likely; disc-dump integrity was checked
+   > and ruled out too — the exact same ISO plays correctly via Dusklight on PC. Root cause is still
+   > open.
+   >
+   > One real debugging obstacle hit and worked around along the way: `mDoMch_Create()` calls
+   > `OSReportDisable()` whenever `NDEBUG` is defined (which `RelWithDebInfo` always is by CMake
+   > default) unless `--develop` is passed — this silences `OSReport`/`OSReport_Error`/etc. entirely,
+   > including the exact diagnostic block `JKRExpHeap::do_alloc` prints right before crashing
+   > (`Failed to alloc memory!`, heap size, used size, free block list). Without `--develop` the crash
+   > report shows only the bare "Aborting due to allocation failure!" with no numbers — looked at
+   > first like a stdio-buffering/lost-output problem (redirecting into a file vs. an interactive
+   > terminal), but that was a red herring; `OSReport_Error` routes through the same `Log.*` framework
+   > as everything else (`src/dusk/OSReport.cpp`), not raw buffered `printf`, so the real fix is
+   > passing `--develop`, not fiddling with stdio buffering. With it, the actual failed allocation
+   > size logs as `0xE427B000` bytes (~3.83 GB) requested from a "System" heap that's only ~32 MB
+   > total — an obviously corrupt/garbage size, not a real GameCube archive size, and not a genuine
+   > out-of-memory condition (2980 MiB physical RAM is not the constraint here). Something in the
+   > disc-archive header parsing path (`JKRArchive::initFileDataPointers` /
+   > `JKRDvdArchive::open`, both in `libs/JSystem`) is computing a wrong size — outside this doc's
+   > "build/platform/packaging only" scope to fix (it's `libs/`, explicitly off-limits per the
+   > original brief), but flagged here since it's the current blocker to a fully playable boot.
+   >
+   > That crash is a separate, later-stage issue tracked outside this doc's scope (Step 1 here is
+   > "does it boot and run," which as of Section B/C it now demonstrably does); Step 1 is not yet
+   > fully closed, but the platform/graphics-backend question this section exists to answer is
+   > resolved.
 
 ## D. Packaging as a ROCKNIX port
 
@@ -354,3 +380,134 @@ resolve UI assets (fonts, icons, RmlUI `.rcss`) via `SDL_GetBasePath()`/CWD-rela
 startup, so a missing `res/` is fatal on the very first frame. Fixed by copying `res/` alongside the
 binary — see `platforms/rocknix/README.md` for the corrected layout. Section C (graphics backend)
 is the next thing to actually verify, now that the game gets far enough to reach it.
+
+## E. Dual screen (Step 2 — in progress, explicitly requested)
+
+Goal: item HUD and minimap move from the top panel to the bottom panel (large, centered), and the
+existing HUD-hide keybind is removed. Out of scope for Step 1, but now explicitly requested, so
+started. This section covers Phase 1 only — proving a second window/surface can actually be driven
+onto the RG DS's second panel at all — not the actual HUD/minimap code relocation, which hasn't
+started yet.
+
+### Hardware reality (verified, not assumed)
+
+The RG DS's two DSI panels are **real, independent hardware displays** — confirmed via the device
+tree (`rk3568-anbernic-rg-ds.dts`): separate `dsi0`/`dsi1` MIPI-DSI controllers, each with its own
+panel node, regulators (`vdd_lcd0`/`vccio_lcd0` vs. `vdd_lcd1`/`vccio_lcd1`), and video-port pipeline
+(`vp0`/`vp1`) — not one panel split in software. Confirmed again at the Wayland level via
+`swaymsg -t get_outputs` on-device: two independent outputs, `DSI-2` (0,0 in sway's virtual output
+layout, focused/powered-on by default — assumed top/primary panel based on that default, not
+independently confirmed which physical panel it is) and `DSI-1` (640,0, powered off by default —
+assumed bottom/secondary). Aurora had **zero** existing multi-window/multi-display infrastructure
+before this — `SDL_CreateWindow` was called exactly once in the entire codebase
+(`extern/aurora/lib/window.cpp`), and no dual-screen code existed anywhere in Dusklight.
+
+### Applying this: the `extern/aurora` changes are a patch, not a submodule commit
+
+`extern/aurora` is a submodule pointing at the upstream `encounter/aurora` repo — this fork has no
+push access there, so the second-window/surface changes below live as a plain diff,
+`rocknix-dual-screen-second-window.patch` (repo root), not as a commit inside the submodule
+checkout (which wouldn't survive a fresh `git submodule update --init` for anyone else anyway).
+After initializing the submodule, apply it:
+
+```sh
+git -C extern/aurora apply ../../rocknix-dual-screen-second-window.patch
+```
+
+(matches the existing `fix-cmake-paths.patch` pattern already in this repo for the same reason —
+a vendored dependency needing a local change this fork can't upstream.)
+
+### What was built (Phase 1)
+
+- `extern/aurora/include/aurora/aurora.h`: `AuroraConfig::enableSecondWindow` (bool, default false
+  via zero-init — no effect on any other platform).
+- `extern/aurora/lib/window.cpp`/`.hpp`: `create_second_window()` — a second SDL window, fixed
+  640x480 (the panel's native mode, not derived from the primary window's configurable size),
+  titled `"Dusklight Lower Screen"` (used as the compositor-side match criterion, see below),
+  `SDL_WINDOW_BORDERLESS`. Wired into `destroy_window()`/shutdown so it's cleaned up with the rest.
+- `extern/aurora/lib/webgpu/gpu.cpp`/`.hpp`: `create_second_surface()` — a second `wgpu::Surface`
+  bound to that window via the *already-generic* `create_window_surface()` helper in
+  `dawn/BackendBinding.cpp` (took a plain `SDL_Window*`, no changes needed there). Deliberately
+  independent of the primary surface's `GraphicsConfig`/framebuffer/depth-buffer machinery — this
+  is a bare clear-color target for now, not a full 3D render target, since Phase 1 only needs to
+  prove the pipe works. `present_second_surface_test_pattern()` clears it to solid magenta every
+  frame — a Phase 1 test signal only, to be replaced once Phase 2 starts.
+- `extern/aurora/lib/aurora.cpp`: creates the second window/surface once the primary
+  device/adapter are up (reuses them — no second WebGPU instance), and calls the test-pattern
+  present once per frame, both gated behind `config.enableSecondWindow`. Non-fatal if creation
+  fails (dual-screen is an enhancement, not a requirement to run).
+- `src/m_Do/m_Do_main.cpp`: `config.enableSecondWindow = getenv("DUSKLIGHT_DUAL_SCREEN") != nullptr`
+  — a runtime opt-in, not a persisted setting or new CMake option, controlled entirely by the
+  packaging layer.
+- `platforms/rocknix/dusklight.sh`: sets `DUSKLIGHT_DUAL_SCREEN=1` by default (override with `=0`
+  to disable) and injects a sway `for_window` rule (see below) before launching.
+
+### Getting an actual second *window* to display — three separate things, not one
+
+Proving this took real on-device iteration; each of these was independently necessary, verified by
+removing it and watching the result regress:
+
+1. **`output DSI-1 power on`.** DSI-1 is powered off by default — confirmed via
+   `/sys/class/backlight/*/bl_power` (`4` = off, `0` = on) and, more fundamentally, via
+   `cat /sys/kernel/debug/dri/*/state`: the connector showed `crtc=(null)` (no CRTC assigned at
+   all, i.e. nothing being scanned out to it whatsoever) until powered on. Without this, the window
+   is created and composited by sway just fine, but the physical output pipeline is simply off —
+   panel stays black regardless of content.
+2. **`move position 640 0`, not `move to output DSI-1`.** Wayland clients cannot request their own
+   absolute window position (unlike X11/Win32 — the protocol just doesn't have that call); only the
+   compositor can place a window at a specific virtual coordinate. `move to output DSI-1` alone (an
+   earlier attempt) reassigns which output/workspace *sway's own bookkeeping* considers the window
+   to belong to (confirmed via `swaymsg -t get_tree` showing `output: DSI-1`), but that alone was
+   **not sufficient** — the panel still stayed black. Explicit positioning at `(640, 0)` — DSI-1's
+   virtual coordinate per `get_outputs` — is what actually made content appear there.
+3. **`border none`.** Without it, the floating window's title bar/border ate into the 640x480
+   content area (`rect` came back as `{x: 642, y: 38, width: 640, height: 455}` instead of exactly
+   `{640, 0, 640, 480}`), visibly cutting a notch out of the primary panel's adjacent edge where the
+   border overflowed into it.
+
+All three are compositor-side, so they live in `platforms/rocknix/dusklight.sh`'s injected
+`for_window` rule, not in Aurora/Dusklight code (`SDL_WINDOW_BORDERLESS` is set too, but as
+belt-and-suspenders only — the sway rule is the one that actually matters under Wayland):
+
+```
+for_window [title="Dusklight Lower Screen"] output DSI-1 power on, border none, move position 640 0, resize set width 640px height 480px
+```
+
+**This rule does not survive between runs and must be (re-)injected every launch, not appended
+once.** `/storage/.config/sway/config` gets regenerated by ROCKNIX's own session/emulator-launch
+scripts (observed directly: the file's mtime changed and a previously-appended rule was gone after
+launching a different app) — so `dusklight.sh` checks-and-appends on every start, not just the
+first, mirroring the same pattern ROCKNIX's own `drastic-sa` package uses for exactly this problem
+(`/storage/.config/sway/config` was found, mid-debugging, to already contain ROCKNIX's own
+`for_window [app_id="drastic"] output DSI-1 power on, ...` rule from a prior DraStic launch —
+independent confirmation this is the actual sanctioned mechanism, not a workaround specific to us).
+
+### A red herring worth recording: how DraStic actually does dual-screen
+
+Before finding the fix above, DraStic (ROCKNIX's bundled closed-source NDS emulator, confirmed
+dual-screen-capable on this exact device) was used as a live reference while debugging — SSH'd in
+while it was running and inspected `swaymsg -t get_tree`. It turned out to use a **completely
+different architecture** than what was first attempted here: a **single** 1280x480 floating window
+(not two separate windows) that spans both outputs' combined virtual canvas (`DSI-2` at x=0..640,
+`DSI-1` at x=640..1280 per sway's layout) and renders its own top/bottom NDS framebuffers into the
+left/right halves of that one buffer — mirroring how a real DS has two physical screens driven from
+one combined framebuffer internally. This was a reasonable hypothesis for a while (and is
+architecturally simpler in some ways), but turned out to be a distraction: the real missing pieces
+were the three items above, all fully compatible with keeping Dusklight's actual two-separate-
+windows approach (which was already built and is what Section E's Phase 1 code implements).
+DraStic's single-window approach is not used here; recorded only because it's what a live,
+side-by-side hardware comparison surfaced along the way, including finding the working sway rule
+pattern.
+
+### Status
+
+Phase 1 confirmed working on real hardware: the second window/surface reaches the physical lower
+panel exactly as intended (`swaymsg -t get_tree` showing `rect: {640, 0, 640, 480}`,
+`border: none`, `output: DSI-1`), no cropped edge on the primary panel. **Not yet done:** the actual
+Phase 2 work — relocating item HUD (`drawButtonA`/`drawButtonB`/`drawButtonXY` in
+`src/d/d_meter2_draw.cpp`) and the minimap (`src/d/d_meter_map.cpp`) to render into the second
+surface instead of the primary one, resizing/centering the minimap for the 640x480 panel, and
+removing the existing HUD-hide keybind. `dMeter2Draw_c::draw()` (`d_meter2_draw.cpp:679`) is a
+single centralized entry point dispatching to per-element draw functions — expected to make this a
+targeted change (redirect specific sub-calls' render target) rather than needing to unpick deeply
+interleaved 3D/2D rendering, but unverified until attempted.

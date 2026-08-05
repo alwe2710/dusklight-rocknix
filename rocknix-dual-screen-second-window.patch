@@ -1,0 +1,333 @@
+diff --git a/include/aurora/aurora.h b/include/aurora/aurora.h
+index 50caa5a..886aeb1 100644
+--- a/include/aurora/aurora.h
++++ b/include/aurora/aurora.h
+@@ -97,6 +97,14 @@ typedef struct {
+   int32_t windowPosY;
+   uint32_t windowWidth;
+   uint32_t windowHeight;
++  /*
++   * Creates a second window/surface (fixed 640x480, titled "Dusklight Lower Screen") alongside
++   * the primary one, for dual-screen devices such as the ROCKNIX Anbernic RG DS. Which physical
++   * panel it ends up on is a compositor/packaging concern, not handled here -- see
++   * platforms/rocknix/dusklight.sh. Defaults to false (zero-initialized); no effect on
++   * single-screen platforms beyond the unused second window/surface never being created.
++   */
++  bool enableSecondWindow;
+   void* iconRGBA8;
+   uint32_t iconWidth;
+   uint32_t iconHeight;
+diff --git a/lib/aurora.cpp b/lib/aurora.cpp
+index 592306c..b309fe4 100644
+--- a/lib/aurora.cpp
++++ b/lib/aurora.cpp
+@@ -167,6 +167,21 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
+   window::show_window();
+ 
+ #ifdef AURORA_ENABLE_GX
++  // Second window/surface for dual-screen devices (e.g. ROCKNIX Anbernic RG DS). Only attempted
++  // once the primary window/device/adapter are up, since webgpu::create_second_surface() reuses
++  // them rather than standing up a second WebGPU instance. Deliberately non-fatal if it fails --
++  // dual-screen is an enhancement, not a requirement to run.
++  if (config.enableSecondWindow && webgpu::g_backendType != wgpu::BackendType::Null) {
++    if (window::create_second_window()) {
++      if (!webgpu::create_second_surface()) {
++        Log.warn("Failed to create second surface; continuing without dual-screen support");
++        window::destroy_second_window();
++      }
++    } else {
++      Log.warn("Failed to create second window; continuing without dual-screen support");
++    }
++  }
++
+   gfx::initialize();
+ 
+   imgui::create_context();
+@@ -405,6 +420,10 @@ void end_frame() noexcept {
+     }
+     gfx::after_submit();
+ 
++    if (g_config.enableSecondWindow) {
++      webgpu::present_second_surface_test_pattern();
++    }
++
+     TracyPlotConfig("aurora: lastVertSize", tracy::PlotFormatType::Memory, false, true, 0);
+     TracyPlotConfig("aurora: lastUniformSize", tracy::PlotFormatType::Memory, false, true, 0);
+     TracyPlotConfig("aurora: lastIndexSize", tracy::PlotFormatType::Memory, false, true, 0);
+diff --git a/lib/webgpu/gpu.cpp b/lib/webgpu/gpu.cpp
+index 3c4bcd9..721ec4b 100644
+--- a/lib/webgpu/gpu.cpp
++++ b/lib/webgpu/gpu.cpp
+@@ -40,6 +40,7 @@ static Module Log("aurora::gpu");
+ wgpu::Device g_device;
+ wgpu::Queue g_queue;
+ wgpu::Surface g_surface;
++wgpu::Surface g_surface2;
+ wgpu::BackendType g_backendType;
+ GraphicsConfig g_graphicsConfig;
+ TextureWithSampler g_frameBuffer;
+@@ -61,6 +62,9 @@ static wgpu::Adapter g_adapter;
+ wgpu::Instance g_instance;
+ wgpu::AdapterInfo g_adapterInfo;
+ static wgpu::SurfaceCapabilities g_surfaceCapabilities;
++static wgpu::SurfaceCapabilities g_surfaceCapabilities2;
++static wgpu::PresentMode g_secondSurfacePresentMode;
++static bool g_secondSurfaceConfigured = false;
+ bool g_hasCoreFeatures = false;
+ bool g_bcTexturesSupported = false;
+ bool g_astcTexturesSupported = false;
+@@ -1059,6 +1063,8 @@ void shutdown() {
+   g_depthBuffer = {};
+   g_queue = {};
+   g_surface = {};
++  g_surface2 = {};
++  g_secondSurfaceConfigured = false;
+   g_device = {};
+   g_adapter = {};
+   g_instance = {};
+@@ -1073,6 +1079,127 @@ void release_surface() noexcept {
+   }
+ }
+ 
++static void release_second_surface_locked() noexcept {
++  if (g_surface2) {
++    g_surface2.Unconfigure();
++  }
++  g_surface2 = {};
++  g_secondSurfaceConfigured = false;
++}
++
++bool create_second_surface() {
++  SDL_Window* window = window::get_second_sdl_window();
++  if (window == nullptr) {
++    Log.error("Failed to create second surface: no second window");
++    return false;
++  }
++  if (!g_instance || !g_adapter || !g_device) {
++    Log.error("Failed to create second surface: primary WebGPU device not ready yet");
++    return false;
++  }
++  window::SurfaceLock surfaceLock;
++  release_second_surface_locked();
++  g_surface2 = create_window_surface(g_instance, window, "SecondSurface");
++  if (!g_surface2) {
++    Log.error("Failed to create second surface");
++    return false;
++  }
++
++  const wgpu::Status status = g_surface2.GetCapabilities(g_adapter, &g_surfaceCapabilities2);
++  if (status != wgpu::Status::Success) {
++    Log.error("Failed to get second surface capabilities: {}", magic_enum::enum_name(status));
++    release_second_surface_locked();
++    return false;
++  }
++  if (g_surfaceCapabilities2.formatCount == 0 || g_surfaceCapabilities2.presentModeCount == 0) {
++    Log.error("Second surface has no formats/present modes");
++    release_second_surface_locked();
++    return false;
++  }
++  auto surfaceFormat = wgpu::TextureFormat::Undefined;
++  for (size_t i = 0; i < g_surfaceCapabilities2.formatCount; ++i) {
++    const auto format = to_linear(g_surfaceCapabilities2.formats[i]);
++    if (format == wgpu::TextureFormat::RGBA8Unorm || format == wgpu::TextureFormat::BGRA8Unorm) {
++      surfaceFormat = format;
++      break;
++    }
++  }
++  if (surfaceFormat == wgpu::TextureFormat::Undefined) {
++    surfaceFormat = g_surfaceCapabilities2.formats[0];
++  }
++  g_secondSurfacePresentMode = select_present_mode(g_surfaceCapabilities2);
++
++  int width = 0;
++  int height = 0;
++  ASSERT(SDL_GetWindowSizeInPixels(window, &width, &height), "Failed to get second window size: {}", SDL_GetError());
++  const wgpu::SurfaceConfiguration surfaceConfiguration{
++      .device = g_device,
++      .format = surfaceFormat,
++      .usage = wgpu::TextureUsage::RenderAttachment,
++      .width = static_cast<uint32_t>(width),
++      .height = static_cast<uint32_t>(height),
++      .presentMode = g_secondSurfacePresentMode,
++  };
++  g_surface2.Configure(&surfaceConfiguration);
++  g_secondSurfaceConfigured = true;
++  Log.info("Second surface configured: {}x{}, format {}", width, height, magic_enum::enum_name(surfaceFormat));
++  return true;
++}
++
++void release_second_surface() noexcept {
++  gfx::gpu_synchronize();
++  {
++    window::SurfaceLock surfaceLock;
++    release_second_surface_locked();
++  }
++}
++
++void present_second_surface_test_pattern() {
++  if (!g_secondSurfaceConfigured || !g_surface2 || !g_device) {
++    return;
++  }
++  wgpu::SurfaceTexture surfaceTexture;
++  {
++    window::SurfaceLock surfaceLock;
++    g_surface2.GetCurrentTexture(&surfaceTexture);
++  }
++  if (surfaceTexture.status != wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal &&
++      surfaceTexture.status != wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
++    return;
++  }
++  const auto view = surfaceTexture.texture.CreateView();
++  const std::array attachments{
++      wgpu::RenderPassColorAttachment{
++          .view = view,
++          .loadOp = wgpu::LoadOp::Clear,
++          .storeOp = wgpu::StoreOp::Store,
++          // Bright, unmissable test color (magenta) -- deliberately not a color that could be
++          // confused with real content, since this is a Phase 1 "does the panel light up at all"
++          // check, not a real render.
++          .clearValue = wgpu::Color{1.0, 0.0, 1.0, 1.0},
++      },
++  };
++  const wgpu::RenderPassDescriptor renderPassDescriptor{
++      .label = "Second surface test pattern",
++      .colorAttachmentCount = attachments.size(),
++      .colorAttachments = attachments.data(),
++  };
++  const wgpu::CommandEncoderDescriptor encoderDescriptor{.label = "Second surface command encoder"};
++  const auto encoder = g_device.CreateCommandEncoder(&encoderDescriptor);
++  const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
++  pass.End();
++  const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Second surface command buffer"};
++  const auto buffer = encoder.Finish(&cmdBufDescriptor);
++  g_queue.Submit(1, &buffer);
++  {
++    window::SurfaceLock surfaceLock;
++    const auto status = g_surface2.Present();
++    if (!status) {
++      Log.warn("Second surface present failed");
++    }
++  }
++}
++
+ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight,
+                                       bool force) {
+   if (!g_surface || !g_device || width == 0 || height == 0 || nativeHeight == 0 || nativeWidth == 0) {
+diff --git a/lib/webgpu/gpu.hpp b/lib/webgpu/gpu.hpp
+index 3943da0..409c6e7 100644
+--- a/lib/webgpu/gpu.hpp
++++ b/lib/webgpu/gpu.hpp
+@@ -42,6 +42,7 @@ struct Viewport {
+ extern wgpu::Device g_device;
+ extern wgpu::Queue g_queue;
+ extern wgpu::Surface g_surface;
++extern wgpu::Surface g_surface2;
+ extern wgpu::BackendType g_backendType;
+ extern GraphicsConfig g_graphicsConfig;
+ extern TextureWithSampler g_frameBuffer;
+@@ -61,6 +62,16 @@ bool initialize(AuroraBackend backend, bool allowCpu);
+ void shutdown();
+ void release_surface() noexcept;
+ bool refresh_surface(bool recreate = true);
++
++// Second surface for dual-screen devices, bound to window::get_second_sdl_window(). Independent
++// of the primary surface's GraphicsConfig/framebuffer/depth-buffer machinery (see gpu.cpp) — this
++// is only ever a bare clear-color target, not a full 3D render target, so it skips all of that.
++// No-op / returns false if window::create_second_window() wasn't called (or failed) first.
++bool create_second_surface();
++void release_second_surface() noexcept;
++// Phase 1 proof-of-concept only: fills the second surface with a solid test color each frame.
++// To be replaced once the second surface is proven reachable on real hardware.
++void present_second_surface_test_pattern();
+ void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight, bool force = false);
+ TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled);
+ const TextureWithSampler& present_source() noexcept;
+diff --git a/lib/window.cpp b/lib/window.cpp
+index 0f7cfb6..5b791bf 100644
+--- a/lib/window.cpp
++++ b/lib/window.cpp
+@@ -39,6 +39,7 @@ namespace {
+ Module Log("aurora::window");
+ 
+ SDL_Window* g_window;
++SDL_Window* g_window2;
+ SDL_Renderer* g_renderer;
+ float g_frameBufferScale = 0.f;
+ bool g_frameBufferAspectFit = false;
+@@ -341,6 +342,48 @@ bool create_window(AuroraBackend backend) {
+   return true;
+ }
+ 
++// Fixed to the RG DS's panel resolution (each of its two DSI panels reports 640x480 to the
++// compositor, confirmed via `swaymsg -t get_outputs` on-device) rather than derived from
++// AuroraConfig's window size, which is sized for the primary/main-view window. Title is a fixed,
++// distinctive string so the packaging layer's compositor rule (see platforms/rocknix/dusklight.sh)
++// can match on it.
++bool create_second_window() {
++  const auto props = SDL_CreateProperties();
++  TRY(SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, "Dusklight Lower Screen"),
++      "Failed to set {}: {}", SDL_PROP_WINDOW_CREATE_TITLE_STRING, SDL_GetError());
++  TRY(SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_UNDEFINED), "Failed to set {}: {}",
++      SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_GetError());
++  TRY(SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_UNDEFINED), "Failed to set {}: {}",
++      SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_GetError());
++  TRY(SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, 640), "Failed to set {}: {}",
++      SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, SDL_GetError());
++  TRY(SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, 480), "Failed to set {}: {}",
++      SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, SDL_GetError());
++  // SDL_WINDOW_BORDERLESS is belt-and-suspenders: window decoration is really the compositor's
++  // call under Wayland (see the packaging layer's `for_window ... border none` rule, which is the
++  // one that actually matters -- without it, the title bar/border eats into the panel's 640x480
++  // content area and cuts a visible notch out of the adjacent screen's edge).
++  TRY(SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER,
++                            SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_BORDERLESS),
++      "Failed to set {}: {}", SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, SDL_GetError());
++  g_window2 = SDL_CreateWindowWithProperties(props);
++  if (g_window2 == nullptr) {
++    Log.error("Failed to create second window: {}", SDL_GetError());
++    return false;
++  }
++  TRY_WARN(SDL_ShowWindow(g_window2), "Failed to show second window: {}", SDL_GetError());
++  return true;
++}
++
++void destroy_second_window() {
++  if (g_window2 != nullptr) {
++    SDL_DestroyWindow(g_window2);
++    g_window2 = nullptr;
++  }
++}
++
++SDL_Window* get_second_sdl_window() { return g_window2; }
++
+ bool create_renderer() {
+   if (g_window == nullptr) {
+     return false;
+@@ -359,6 +402,7 @@ bool create_renderer() {
+ }
+ 
+ void destroy_window() {
++  destroy_second_window();
+   if (g_renderer != nullptr) {
+     SDL_DestroyRenderer(g_renderer);
+     g_renderer = nullptr;
+diff --git a/lib/window.hpp b/lib/window.hpp
+index 51257ea..6723f65 100644
+--- a/lib/window.hpp
++++ b/lib/window.hpp
+@@ -37,6 +37,15 @@ void show_window();
+ AuroraWindowSize get_window_size();
+ const AuroraEvent* poll_events();
+ SDL_Window* get_sdl_window();
++
++// Second window for dual-screen devices (e.g. ROCKNIX Anbernic RG DS). No-op / returns false
++// when AuroraConfig::enableSecondWindow was not set at initialize() time. Output placement
++// (which physical panel it ends up on) is left to the compositor/packaging layer (see
++// platforms/rocknix/dusklight.sh) rather than done here, to avoid racing the compositor seeing
++// the new window's title before we could ask it to move it.
++bool create_second_window();
++void destroy_second_window();
++SDL_Window* get_second_sdl_window();
+ SDL_Renderer* get_sdl_renderer();
+ bool is_paused() noexcept;
+ bool is_presentable() noexcept;

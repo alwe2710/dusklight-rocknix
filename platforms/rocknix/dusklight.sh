@@ -36,6 +36,32 @@
 # Override for one run without touching config.json:
 #   DUSKLIGHT_BACKEND=opengles roms/ports/Dusklight.sh
 # or persist the choice by editing backend.graphicsBackend in config.json (see docs).
+#
+# Dual screen (Step 2, in progress): the RG DS exposes its two DSI panels as independent Wayland
+# outputs -- confirmed on-device via `swaymsg -t get_outputs`: DSI-2 (0,0, focused, powered on by
+# default -- the top/primary screen) and DSI-1 (640,0, powered off by default -- the bottom/lower
+# screen; sway's reported X/Y here is just its virtual output layout, not the panels' physical
+# top/bottom relationship, which this assumes based on which one is on/focused by default).
+# Dusklight creates a second window titled "Dusklight Lower Screen" when DUSKLIGHT_DUAL_SCREEN is
+# set.
+#
+# Getting a second *window* to actually show up on DSI-1 needs three things sway has to do, not
+# just one -- worked out empirically on-device (see docs/rocknix-porting.md), and the same pattern
+# ROCKNIX's own drastic-sa uses (`for_window [app_id="drastic"] output DSI-1 power on, ...` in
+# /storage/.config/sway/config, which ROCKNIX regenerates on every emulator/port launch -- our own
+# appended rule does NOT survive that and must be re-added on every run, not just once):
+#   1. `output DSI-1 power on` -- DSI-1 is powered off by default (confirmed via
+#      /sys/class/backlight/*/bl_power and DRM connector state showing crtc=(null) until powered
+#      on); without this the window is composited correctly but the panel backlight/CRTC pipeline
+#      is simply off, so it stays black regardless of what's rendered.
+#   2. `move position 640 0` -- Wayland clients cannot request their own absolute window position
+#      (unlike X11/Win32); only the compositor can place a window at DSI-1's virtual coordinates
+#      (640,0 in sway's output layout, confirmed via `swaymsg -t get_outputs`). `move to output
+#      DSI-1` alone (an earlier attempt) was not sufficient -- it reassigns which output/workspace
+#      sway *considers* the window to belong to, but didn't actually get it to render there.
+#   3. `border none` -- without this the floating window's title bar/border eats into the 640x480
+#      content area, cutting a visible notch out of the adjacent primary screen's edge.
+# Set DUSKLIGHT_DUAL_SCREEN=0 to disable and run single-screen only.
 
 set -euo pipefail
 
@@ -77,6 +103,19 @@ ARGS=(--dvd "${DVD_PATH}")
 
 if [ -n "${DUSKLIGHT_BACKEND:-}" ]; then
     ARGS+=(--backend "${DUSKLIGHT_BACKEND}")
+fi
+
+DUSKLIGHT_DUAL_SCREEN="${DUSKLIGHT_DUAL_SCREEN:-1}"
+export DUSKLIGHT_DUAL_SCREEN
+if [ "${DUSKLIGHT_DUAL_SCREEN}" != "0" ] && command -v swaymsg >/dev/null 2>&1; then
+    SWAY_CONFIG="/storage/.config/sway/config"
+    SWAY_RULE='for_window [title="Dusklight Lower Screen"] output DSI-1 power on, border none, move position 640 0, resize set width 640px height 480px'
+    # ROCKNIX regenerates this config on emulator/port launches, so our appended rule does not
+    # reliably survive between runs -- always ensure it's present rather than checking once.
+    if [ -f "${SWAY_CONFIG}" ] && ! grep -qF "${SWAY_RULE}" "${SWAY_CONFIG}" 2>/dev/null; then
+        printf '\n# Added by Dusklight (dual-screen HUD/minimap on lower panel)\n%s\n' "${SWAY_RULE}" >> "${SWAY_CONFIG}"
+        swaymsg reload >/dev/null 2>&1 || true
+    fi
 fi
 
 cd "${PORT_DIR}"
