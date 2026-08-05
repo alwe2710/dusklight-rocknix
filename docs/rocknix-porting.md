@@ -3,6 +3,11 @@
 Status: Step 1 only — a native, standalone port running on the RG DS. Dual-screen support
 (second display, streaming, alternative layouts) is out of scope; do not start on it here.
 
+Toolchain build and cross-build (Sections A/B) are done — a real `dusklight` aarch64 binary has
+been produced with the actual ROCKNIX-built toolchain, packaged per Section D below. Graphics
+backend (Section C) is still unverified: it needs an actual run on RG DS hardware, which this pass
+didn't have access to.
+
 This documents the cross-toolchain setup, cross-build, graphics-backend verification, and
 packaging needed to run Dusklight on ROCKNIX's RK3566 target (covers the RG DS; RK3568 dtb
 `rk3568-anbernic-rg-ds.dtb` lives under the same RK3566 device tree in ROCKNIX, no per-model
@@ -96,65 +101,115 @@ ROCKNIX's own build generates its internal `cmake-$TARGET_NAME.conf` (`config/fu
 
 ## B. Cross-build
 
+**Status: done — built end-to-end with a real ROCKNIX-produced toolchain (not the generic-toolchain
+smoke test below) and linked successfully.** The steps and flags below are what that build actually
+needed, not a prediction.
+
 ```sh
 cmake --preset linux-default-relwithdebinfo \
   -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-rocknix-rk3566.cmake \
   -DROCKNIX_TOOLCHAIN_ROOT=/path/to/.../toolchain \
-  -DAURORA_DAWN_PROVIDER=package
+  -DAURORA_DAWN_PROVIDER=package \
+  -DSDL_X11=OFF -DSDL_WAYLAND=ON \
+  -DHAVE_GETRESGID=1 -DHAVE_GETRESUID=1 \
+  -DRust_CARGO_TARGET=aarch64-unknown-linux-gnu
 cmake --build --preset linux-default-relwithdebinfo
 ```
 
-`BUILD_SHARED_LIBS=OFF` is already the `linux-default` preset default — keep it, fewer runtime
-deps to bundle on-device. `AURORA_DAWN_PROVIDER=package` pulls the prebuilt `linux-aarch64` Dawn
-package instead of vendoring a Dawn build (see `extern/aurora/cmake/AuroraDawnProvider.cmake`);
-this was confirmed reachable (`github.com/encounter/dawn/releases/download/...`) even from the
-network-restricted sandbox that wrote this doc.
+`ROCKNIX_TOOLCHAIN_ROOT` must be exported as an environment variable (not just passed as `-D`) for
+the **build** step, not only configure: `libjpeg-turbo-ext` is pulled in via `ExternalProject_Add`
+and spawns its own nested `cmake` configure at *build* time, which re-reads
+`cmake/toolchain-rocknix-rk3566.cmake` from scratch and only sees the toolchain root if it's in the
+process environment. A `-D` on the outer configure invocation does not reach it.
 
-Expect cross-compile-specific failures the first time through: headers/libs in
-`docs/building.md`'s Ubuntu/Arch package lists are host packages, and won't exist for aarch64 on a
+`BUILD_SHARED_LIBS=OFF` is already the `linux-default` preset default. `AURORA_DAWN_PROVIDER=package`
+pulls the prebuilt `linux-aarch64` Dawn package instead of vendoring a Dawn build (see
+`extern/aurora/cmake/AuroraDawnProvider.cmake`) — confirmed working end-to-end.
+
+The three extra `-D` flags above are all real fixes for real failures hit during this build, each
+confirmed necessary (not cargo-culted):
+
+- **`-DSDL_X11=OFF -DSDL_WAYLAND=ON`**: without target packages for Wayland, SDL3's configure
+  aborts with "SDL could not find X11 or Wayland development libraries" (build `wayland`,
+  `wayland-protocols`, `libxkbcommon`, and `libglvnd` — see below — to get past this). Once those
+  packages exist in the sysroot, SDL3 auto-detects **both** Wayland and X11 (`libglvnd` pulls in
+  `libX11` as a transitive dependency, which is enough for SDL's X11 check to pass) and then fails
+  again demanding X11-only packages (`libXcursor` etc.) that ROCKNIX/RK3566 doesn't ship and that
+  we don't want, since the device boots into sway/Wayland, not X11. Forcing `SDL_X11=OFF` avoids
+  needing those X11-extension packages at all, consistent with the "Display server" correction
+  above.
+- **`-DHAVE_GETRESGID=1 -DHAVE_GETRESUID=1`**: SDL3's `CMakeLists.txt` appends `-D_GNU_SOURCE=1` to
+  `CMAKE_REQUIRED_FLAGS` near the top of the file (for exactly this kind of glibc feature-macro
+  issue), but that flag isn't present anymore by the time `check_symbol_exists(getresgid ...)` runs
+  ~1000 lines later (confirmed via `CMakeConfigureLog.yaml`: the actual failed check command has no
+  `_GNU_SOURCE` in it) — an SDL3 CMake bug, not a ROCKNIX/sysroot problem. Both functions are
+  genuinely declared in the ROCKNIX glibc's `unistd.h` under `__USE_GNU` and compile fine with
+  `-D_GNU_SOURCE=1` (verified with a standalone compile). Without this override, SDL3 defines its
+  own `static inline getresgid()`/`getresuid()` fallback in `SDL_gtk.c`, which then conflicts with
+  glibc's real (non-static) declaration and fails to compile. Pre-seeding the two `HAVE_*` cache
+  variables skips SDL's broken check entirely (`CheckSymbolExists.cmake` only runs the check
+  `if(NOT DEFINED "${VARIABLE}")`) and is factually correct, not a workaround-of-convenience.
+- **`-DRust_CARGO_TARGET=aarch64-unknown-linux-gnu`**: `extern/aurora`'s `nod` (GameCube/Wii disc
+  I/O) dependency has no prebuilt `linux-aarch64` package upstream (checked
+  `github.com/encounter/nod/releases` directly — only `linux-x86_64`, `macos-arm64`,
+  `windows-x86_64` `libnod-*` archives exist; `nodtool-linux-aarch64` is a separate CLI binary, not
+  the library), so `AuroraNodProvider.cmake`'s `auto` resolution falls through to `vendor`
+  (build-from-source via Corrosion). Corrosion picked the correct cross-compiler as the linker but
+  left Cargo building for the **host** Rust target (`x86_64-unknown-linux-gnu`) by default, so
+  rustc's x86_64 objects got fed to the aarch64 linker (`unrecognized command-line option '-m64'`).
+  `AuroraNodProvider.cmake` already has an equivalent forced-target special case for 32-bit Windows
+  (`if (WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4) ... set(Rust_CARGO_TARGET "i686-pc-windows-msvc" ...)`)
+  — this is the same fix, just for this target. Also requires the `aarch64-unknown-linux-gnu` Rust
+  std to actually be installed (`rustup target add aarch64-unknown-linux-gnu`); a plain distro
+  `rustc` package (e.g. Arch's) usually ships only the host std.
+
+Beyond the above, expect ordinary cross-compile "missing sysroot package" failures: headers/libs in
+`docs/building.md`'s Ubuntu/Arch package lists are host packages and won't exist for aarch64 on a
 plain x86_64 host. `CMAKE_FIND_ROOT_PATH_MODE_{LIBRARY,INCLUDE,PACKAGE}=ONLY` in the toolchain file
-means CMake will only look in the ROCKNIX sysroot for these, not fall back to /usr on the host —
-so any missing dependency needs to actually exist in the sysroot ROCKNIX's toolchain build
-produced (ROCKNIX's package build system installs a matching sysroot copy for every target package
-it builds; anything Dusklight needs beyond what the base toolchain step already provides may need
-building on the ROCKNIX side too, e.g. `PROJECT=ROCKNIX DEVICE=RK3566 ARCH=aarch64 ./scripts/build_mt
-<pkg>`). Fix these as they come up rather than assuming the package list in `docs/building.md`
-maps 1:1.
+means CMake only looks in the ROCKNIX sysroot for these — build the missing package for target via
+`PROJECT=ROCKNIX DEVICE=RK3566 ARCH=aarch64 ./scripts/build_mt <pkg>` (it installs straight into
+`$ROCKNIX_TOOLCHAIN_ROOT/aarch64-rocknix-linux-gnu/sysroot`, confirmed identical to
+`SYSROOT_PREFIX` in ROCKNIX's own `config/path`, so no extra wiring is needed). This build needed,
+beyond the base `toolchain` target: `wayland wayland-protocols libxkbcommon` (Wayland/keyboard
+support for SDL) and `libglvnd` (provides `egl.pc`, needed by SDL's GLES/EGL detection — lighter
+than building all of `mesa`, since actual GLES/Vulkan loading happens via `dlopen` at runtime, not
+link time; SDL and WebGPU/Dawn only need the headers/pkg-config files at build time).
 
-### Sandbox constraints (why this wasn't run end-to-end here)
+One CMake footgun hit along the way: after the *first* failed configure attempt (before the Wayland
+packages existed), CMake caches negative `find_package`/`pkg_check_modules` results in
+`CMakeCache.txt`. A `--fresh` reconfigure (or `rm -rf build/<preset>`) is needed after fixing a
+missing-sysroot-package error — otherwise the stale cached "not found" persists even once the
+package is actually there.
 
-The session that wrote this doc could not pull `ghcr.io/rocknix/rocknix-build` — its blob storage
-host (`pkg-containers.githubusercontent.com`) is blocked by that sandbox's egress policy (403,
-confirmed via the environment's own proxy diagnostics, which explicitly say to report rather than
-route around such blocks). `CMakeLists.txt` itself has no ROCKNIX/Linux-variant-specific logic
-that would obviously break (checked: no unconditional X11 requirement, no non-generic-Linux
-assumptions beyond the Wayland-is-already-on point above).
+### Toolchain build (also done, not just this cross-build)
 
-A generic (non-ROCKNIX) `aarch64-linux-gnu` toolchain was used for a one-off smoke test of the
-*CMake plumbing only* — never as a stand-in for the real target, per the brief's explicit
-requirement for a glibc/kernel-header-matched toolchain. It's useful for what it found, not as
-build verification:
+The ROCKNIX-produced toolchain itself (Section A) was also actually built here, via
+`podman run ... ghcr.io/rocknix/rocknix-build:latest bash -c 'PROJECT=ROCKNIX DEVICE=RK3566
+ARCH=aarch64 ./scripts/build_mt toolchain'` (Docker was present but not usable — the invoking user
+isn't in the `docker` group and `/var/run/docker.sock` isn't group-writable for them; ROCKNIX's own
+Makefile already falls back to `podman` automatically when `docker` isn't usable, rootless podman
+works fine here). 51 package steps, ending in `gcc:bootstrap` (GCC 15.2.0,
+`aarch64-rocknix-linux-gnu`) and `glibc:target`. No sandbox network blocks were hit in this
+environment (unlike an earlier session that wrote the rest of this doc — `ghcr.io` and
+`codeload.github.com` were both reachable here), so the "sandbox constraints" caveats from that
+earlier pass no longer apply; they're kept below only as a record of what an *actually* restricted
+environment looks like, in case this doc is reused somewhere more locked down.
 
-- The toolchain-file mechanics themselves are sound: cross-compiler detection, `-mcpu` flags, and
-  `AURORA_DAWN_PROVIDER=package` all worked and correctly triggered the prebuilt `linux-aarch64`
-  Dawn package fetch.
-- Ubuntu's `gcc-*-aarch64-linux-gnu` cross packages and its `:arm64` multiarch dev packages
-  (`libasound2-dev:arm64` etc., needed to even approximate `docs/building.md`'s dependency list)
-  use two different, non-overlapping sysroot layouts (`/usr/aarch64-linux-gnu/` for the cross
-  packages vs. plain multiarch paths under `/usr/lib/aarch64-linux-gnu/` for the `:arm64`
-  packages) — `CMAKE_FIND_ROOT_PATH` can only point at one. This is exactly the class of problem a
-  single self-contained ROCKNIX-built sysroot avoids, and is itself a reason not to substitute a
-  generic toolchain even for local iteration.
-- Also hit a second blocked GitHub host distinct from the `ghcr.io` one: `codeload.github.com`
-  (`https://github.com/.../archive/refs/tags/...tar.gz`, used by several `FetchContent` deps
-  including abseil-cpp — note release-asset downloads via `objects.githubusercontent.com`, e.g.
-  the Dawn package itself, were reachable, just not archive-tarball downloads). Confirmed via
-  direct `curl`, not routed around, same as the `ghcr.io` block. This is a sandbox-only
-  restriction; a normal developer machine won't hit it.
+<details>
+<summary>Earlier sandbox-constrained session's notes (superseded — kept for reference only)</summary>
 
-Net: the cross-build is expected to mainly hit the "missing sysroot package" class of error
-described above — but that's an expectation, not a verified fact for the *real* toolchain. Run
-section B yourself, with the real ROCKNIX-built toolchain, and fix forward from there.
+The session that first wrote this doc could not pull `ghcr.io/rocknix/rocknix-build` — its blob
+storage host (`pkg-containers.githubusercontent.com`) was blocked by that sandbox's egress policy
+(403). A generic (non-ROCKNIX) `aarch64-linux-gnu` toolchain was used there for a one-off smoke
+test of the *CMake plumbing only*: cross-compiler detection, `-mcpu` flags, and
+`AURORA_DAWN_PROVIDER=package` all worked mechanically, and Ubuntu's `gcc-*-aarch64-linux-gnu`
+cross packages vs. `:arm64` multiarch dev packages were found to use two non-overlapping sysroot
+layouts (`/usr/aarch64-linux-gnu/` vs. `/usr/lib/aarch64-linux-gnu/`) — a reason not to substitute a
+generic toolchain even for local iteration. That session also hit `codeload.github.com` being
+blocked separately from `ghcr.io`. None of this applied in the environment that did the real build
+above.
+
+</details>
 
 ## C. Graphics backend — empirical, not assumed
 
@@ -210,3 +265,39 @@ whether ROCKNIX's global profile.d config is sufficient or needs an explicit ove
 brief's own instruction not to assume interconnects it hasn't verified. The GameCube dump path is
 user-provided and configurable (`game/` subfolder or `DUSKLIGHT_DVD_PATH`), never hardcoded or
 bundled.
+
+**Status: a real package has been built from the Section B binary**, not just templated. The
+build output (`build/linux-default-relwithdebinfo/dusklight`) is a genuine
+`ELF 64-bit LSB executable, ARM aarch64 ... for GNU/Linux 6.10.0` — confirmed with `file` and
+`readelf -d` against the ROCKNIX cross-toolchain's own `readelf`, not assumed from the build
+succeeding. `readelf -d` lists exactly six `NEEDED` entries: `libc.so.6`, `libm.so.6`,
+`ld-linux-aarch64.so.1` (core glibc/dynamic-linker — always from the device, never bundled, since
+they must match the running kernel/base image exactly) and `libgcc_s.so.1`, `libstdc++.so.6`,
+`libz.so.1` (auxiliary runtime libs — bundled alongside the binary, since `RPATH=$ORIGIN` is already
+set by `CMakeLists.txt:203-204` and there's no guarantee the on-device versions match ours; sourced
+straight from the toolchain's own sysroot/lib, so they're guaranteed ABI-compatible with the
+binary). Confirms the doc's "Grafiktreiber"/backend libraries (Vulkan loader, GLES/EGL, Wayland)
+are **not** link-time `NEEDED` entries at all — SDL and Dawn `dlopen()` those at runtime, matching
+`SDL_DLOPEN_NOTES`/`SDL_HIDAPI` etc. being enabled in the SDL3 configure summary — so nothing
+Wayland/Vulkan/GLES-related needs bundling here, only linked into the sysroot at build time.
+
+The RelWithDebInfo binary is 490 MB unstripped (debug info intentionally kept by the preset for
+first-hardware-test crash debugging); stripped with the ROCKNIX toolchain's own `strip` for the
+actual deployable package it's 47 MB. Packaged layout matches Section D exactly:
+
+```
+roms/ports/Dusklight.sh
+roms/ports/dusklight/
+  dusklight             (stripped, 47 MB)
+  libgcc_s.so.1
+  libstdc++.so.6
+  libz.so.1
+  game/                 (empty — user drops their own dump here)
+  logs/                 (created by the launcher on first run)
+```
+
+Total package ~50 MB uncompressed, ~24 MB as `tar.gz`. To install: extract onto the SD card's
+`/storage/roms/ports/` (or scp the same layout directly there over the network/SSH, whichever
+ROCKNIX transfer method is in use), drop a GameCube dump into `dusklight/game/`, and launch
+"Dusklight" from the ROCKNIX ports menu. Section C (graphics backend) is the next thing to actually
+verify once it boots.
