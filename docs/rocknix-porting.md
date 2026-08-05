@@ -177,6 +177,17 @@ support for SDL) and `libglvnd` (provides `egl.pc`, needed by SDL's GLES/EGL det
 than building all of `mesa`, since actual GLES/Vulkan loading happens via `dlopen` at runtime, not
 link time; SDL and WebGPU/Dawn only need the headers/pkg-config files at build time).
 
+**`alsa-lib` was missed on the first hardware pass** — without it in the sysroot, SDL3's configure
+silently falls back to `Audio drivers: disk dummy` (no real output driver at all, not even a
+warning at configure time that anything's missing) instead of erroring out like the Wayland/EGL
+gaps did. First real-hardware run had no sound as a result. Build it like the others
+(`./scripts/build_mt alsa-lib`, `PKG_DEPENDS_TARGET="toolchain"` only, no extra deps) and reconfigure
+fresh; `Audio drivers: alsa disk dummy` confirms it's picked up. Unlike the other bundled libs (see
+Section D), `libasound.so.2` is deliberately *not* bundled alongside the binary — ROCKNIX ships its
+own ALSA already, tied to its own audio routing/mixer config for this device (dmix, card profiles,
+etc.); shipping a fresh `alsa-lib` build instead risks it loading fine but not actually reaching the
+right audio device. Rely on the system's copy for this one.
+
 One CMake footgun hit along the way: after the *first* failed configure attempt (before the Wayland
 packages existed), CMake caches negative `find_package`/`pkg_check_modules` results in
 `CMakeCache.txt`. A `--fresh` reconfigure (or `rm -rf build/<preset>`) is needed after fixing a
@@ -299,18 +310,21 @@ bundled.
 build output (`build/linux-default-relwithdebinfo/dusklight`) is a genuine
 `ELF 64-bit LSB executable, ARM aarch64 ... for GNU/Linux 6.10.0` — confirmed with `file` and
 `readelf -d` against the ROCKNIX cross-toolchain's own `readelf`, not assumed from the build
-succeeding. `readelf -d` lists exactly six `NEEDED` entries: `libc.so.6`, `libm.so.6`,
+succeeding. `readelf -d` lists seven `NEEDED` entries: `libc.so.6`, `libm.so.6`,
 `ld-linux-aarch64.so.1` (core glibc/dynamic-linker — always from the device, never bundled, since
-they must match the running kernel/base image exactly) and `libgcc_s.so.1`, `libstdc++.so.6`,
+they must match the running kernel/base image exactly); `libgcc_s.so.1`, `libstdc++.so.6`,
 `libz.so.1` (auxiliary runtime libs — bundled alongside the binary, since `RPATH=$ORIGIN` is already
 set by `CMakeLists.txt:203-204` and there's no guarantee the on-device versions match ours; sourced
 straight from the toolchain's own sysroot/lib, so they're guaranteed ABI-compatible with the
-binary). Confirms the doc's "Grafiktreiber"/backend libraries (Vulkan loader, GLES/EGL, Wayland)
-are **not** link-time `NEEDED` entries at all — SDL and Dawn `dlopen()` those at runtime, matching
-`SDL_DLOPEN_NOTES`/`SDL_HIDAPI` etc. being enabled in the SDL3 configure summary — so nothing
-Wayland/Vulkan/GLES-related needs bundling here, only linked into the sysroot at build time.
+binary); and `libasound.so.2` (ALSA — deliberately **not** bundled, unlike the other three: ROCKNIX
+ships its own ALSA tied to this device's actual audio routing/mixer config, and a freshly-built
+`alsa-lib` alongside the binary risks loading fine but not reaching the right output — rely on the
+system's copy here). Confirms the doc's "Grafiktreiber"/backend libraries (Vulkan loader, GLES/EGL,
+Wayland) are **not** link-time `NEEDED` entries at all — SDL and Dawn `dlopen()` those at runtime,
+matching `SDL_DLOPEN_NOTES`/`SDL_HIDAPI` etc. being enabled in the SDL3 configure summary — so
+nothing Wayland/Vulkan/GLES-related needs bundling here, only linked into the sysroot at build time.
 
-The RelWithDebInfo binary is 490 MB unstripped (debug info intentionally kept by the preset for
+The RelWithDebInfo binary is ~490 MB unstripped (debug info intentionally kept by the preset for
 first-hardware-test crash debugging); stripped with the ROCKNIX toolchain's own `strip` for the
 actual deployable package it's 47 MB. Packaged layout matches Section D exactly:
 
@@ -320,7 +334,7 @@ roms/ports/dusklight/
   dusklight             (stripped, 47 MB)
   libgcc_s.so.1
   libstdc++.so.6
-  libz.so.1
+  libz.so.1              (libasound.so.2 NOT bundled — see above, rely on ROCKNIX's own)
   res/                  (7.6 MB — fonts, icons, RmlUI stylesheets; REQUIRED, see below)
   game/                 (empty — user drops their own dump here)
   logs/                 (created by the launcher on first run)
