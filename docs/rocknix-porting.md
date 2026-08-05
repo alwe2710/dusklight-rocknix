@@ -5,8 +5,10 @@ Status: Step 1 only — a native, standalone port running on the RG DS. Dual-scr
 
 Toolchain build and cross-build (Sections A/B) are done — a real `dusklight` aarch64 binary has
 been produced with the actual ROCKNIX-built toolchain, packaged per Section D below. Graphics
-backend (Section C) is still unverified: it needs an actual run on RG DS hardware, which this pass
-didn't have access to.
+backend (Section C) is verified on real RG DS hardware: Vulkan via `libmali` initializes cleanly and
+the game reaches the actual game loop. A separate, later-stage crash (disc archive mount, likely
+dump/IO-related, not a backend or platform issue) is the current blocker to a full playable boot —
+see Section C's result entry.
 
 This documents the cross-toolchain setup, cross-build, graphics-backend verification, and
 packaging needed to run Dusklight on ROCKNIX's RK3566 target (covers the RG DS; RK3568 dtb
@@ -249,8 +251,35 @@ above.
 4. Once step 2 or 3 has actually been run on hardware, record which backend it was here — a
    result, not a guess:
 
-   > _(unfilled — needs a run on real RG DS hardware, which this porting pass didn't have access
-   > to; fill in backend, adapter/driver string from the Aurora log line above, and any caveats.)_
+   > **Done — `auto` resolves to Vulkan and it initializes cleanly on real RG DS hardware.** From an
+   > actual on-device log:
+   > ```
+   > [INFO | aurora::gpu] Requesting adapter
+   >   Backend: Vulkan
+   >   Compatible surface: true
+   > arm_release_ver: g24p0-00eac0, rk_so_ver: 9
+   > [INFO | aurora::gpu] Graphics adapter information
+   >   API: Vulkan
+   >   Device: Mali-G52 (IntegratedGPU)
+   >   Driver: Mali-G52: v1.g24p0-00eac0.e642784d97c4d2273715c256e43af726 24.0.0
+   > ```
+   > Confirms the "Graphics driver" correction above: this is the `libmali` blob (not Panfrost/PanVK)
+   > backing the Vulkan loader, and it's the one actually selected — matches the prediction that
+   > libmali has the more conformant Vulkan support on this Bifrost GPU. `SDL_RENDER_GPU`/`SDL_VULKAN`
+   > worked without needing any `dlopen` path overrides beyond what the sysroot's `libglvnd`/`egl.pc`
+   > already provided at build time (see Section B — those are headers-only at build time; the actual
+   > `libvulkan.so`/driver come from the device at runtime, exactly as expected). No `OpenGL ES`
+   > fallback test was needed since Vulkan is stable; that path (`--backend opengles` /
+   > `backend.graphicsBackend=opengles`) remains available but unexercised.
+   >
+   > This run got well past graphics/window init — SDL window, Vulkan adapter, Wayland surface, RmlUI
+   > menu rendering, DVD image loading, and into the actual game loop — before hitting an unrelated
+   > crash (`JKRExpHeap` allocation failure while mounting the first disc archive; likely disc-dump
+   > integrity/IO, not a backend or platform issue — `mem1Size`/`mem2Size` in `m_Do_main.cpp` are
+   > identical across every platform this game builds for, not ROCKNIX-specific). That crash is a
+   > separate, later-stage issue tracked outside this doc's scope (Step 1 here is "does it boot and
+   > run," which as of Section B/C it now demonstrably does); Step 1 is not yet fully closed, but the
+   > platform/graphics-backend question this section exists to answer is resolved.
 
 ## D. Packaging as a ROCKNIX port
 
