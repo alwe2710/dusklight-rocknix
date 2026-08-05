@@ -292,12 +292,22 @@ roms/ports/dusklight/
   libgcc_s.so.1
   libstdc++.so.6
   libz.so.1
+  res/                  (7.6 MB — fonts, icons, RmlUI stylesheets; REQUIRED, see below)
   game/                 (empty — user drops their own dump here)
   logs/                 (created by the launcher on first run)
 ```
 
-Total package ~50 MB uncompressed, ~24 MB as `tar.gz`. To install: extract onto the SD card's
+Total package ~57 MB uncompressed, ~29 MB as `tar.gz`. To install: extract onto the SD card's
 `/storage/roms/ports/` (or scp the same layout directly there over the network/SSH, whichever
 ROCKNIX transfer method is in use), drop a GameCube dump into `dusklight/game/`, and launch
-"Dusklight" from the ROCKNIX ports menu. Section C (graphics backend) is the next thing to actually
-verify once it boots.
+"Dusklight" from the ROCKNIX ports menu.
+
+**First deploy attempt shipped without `res/` and failed silently on-device**: the game briefly
+flashed a black window and immediately returned to the ROCKNIX menu, no error visible outside the
+log — because `res/` (populated next to the binary by a `CMakeLists.txt` `POST_BUILD`
+`copy_directory` step) had been left out when hand-assembling the deploy package instead of copying
+the whole build output directory. `src/dusk/imgui/ImGuiEngine.cpp` and `src/dusk/ui/ui.cpp` both
+resolve UI assets (fonts, icons, RmlUI `.rcss`) via `SDL_GetBasePath()`/CWD-relative `res/...` at
+startup, so a missing `res/` is fatal on the very first frame. Fixed by copying `res/` alongside the
+binary — see `platforms/rocknix/README.md` for the corrected layout. Section C (graphics backend)
+is the next thing to actually verify, now that the game gets far enough to reach it.

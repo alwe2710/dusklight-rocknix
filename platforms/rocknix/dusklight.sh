@@ -8,7 +8,14 @@
 #   /storage/roms/ports/dusklight/     <- everything below
 #     dusklight                        <- cross-built binary (platform/CMakeLists RPATH=$ORIGIN,
 #                                          so bundle any non-statically-linked shared libs here too)
-#     assets/, res/, ...               <- whatever runtime data files the build produces/needs
+#     res/                             <- REQUIRED, not optional: fonts/icons/RmlUI stylesheets the
+#                                          binary loads relative to itself at startup (SDL_GetBasePath()
+#                                          / CWD-relative "res/..."). Missing this crashes on the very
+#                                          first frame — window flashes black, straight back to the
+#                                          ROCKNIX menu, no visible error. Copy build/<preset>/res
+#                                          verbatim; it's a CMake POST_BUILD step, easy to miss if you
+#                                          hand-assemble the deploy dir instead of copying the whole
+#                                          build output next to the binary.
 #     game/                            <- put your own GameCube dump here (ISO/RVZ/WIA/WBFS/CISO/GCZ);
 #                                          NOT provided by this repo, see docs/building.md "Running"
 #
