@@ -48,9 +48,15 @@
 
 #if TARGET_PC
 #include <SDL3/SDL_video.h>
+#include "aurora/gfx.hpp"
 #include "aurora/lib/window.hpp"
 #include "d/actor/d_a_horse.h"
+#include "d/d_meter2.h"
+#include "d/d_meter2_draw.h"
+#include "d/d_meter_map.h"
+#include "dusk/dual_screen.hpp"
 #include "dusk/dusk.h"
+#include "dusk/lower_screen_touch.hpp"
 #include "helpers/endian.h"
 #include "dusk/frame_interpolation.h"
 #include "dusk/gfx.hpp"
@@ -2194,6 +2200,66 @@ static void drawItem3D() {
     j3dSys.reinitGX();
 }
 
+#if TARGET_PC
+// Dual screen (ROCKNIX RG DS, Step 2): renders the minimap and item HUD into their own offscreen
+// passes and hands the results to Aurora for display on the second window/surface (lower panel).
+// Called after the normal 2D dispatch (dComIfGd_draw2DOpa/OpaTop/Xlu) in both mDoGph_Painter()
+// branches below. Both dMeterMap_c::draw() and dMeter2Draw_c::draw() already skip their own
+// top-screen drawing when dual screen is active (see d_meter_map.cpp / d_meter2_draw.cpp), so
+// this is additive, not a duplicate.
+//
+// The item HUD (A/B/X/Y/Z prompts + D-pad) gets its own, deliberately smaller offscreen pass
+// instead of sharing the minimap's full 640x480 one: aurora::gfx::set_second_surface_overlay_source
+// stretches whatever it's given to fill the whole panel at present time (see
+// webgpu::present_second_surface in extern/aurora), so rendering into a pass that's 1/1.5th the
+// panel size comes out 1.5x on screen -- a uniform scale independent of the minimap's own (2x),
+// without touching J2D matrix/scale state or the item HUD's regular top-screen size/position
+// logic (dMeter2_c::moveButtonXY/moveButtonCross, which still runs, and bakes in, unchanged).
+// Two offscreen passes can't be open at once (aurora::gfx::create_pass asserts against nesting),
+// so this runs sequentially: resolve and hand off the minimap before opening the item HUD's pass.
+static void mDoGph_drawLowerScreen() {
+    if (!dusk::is_dual_screen_active()) {
+        return;
+    }
+    dMeter2_c* meter = dMeter2Info_getMeterClass();
+    if (meter == NULL) {
+        return;
+    }
+    dMeterMap_c* map = meter->getMeterMapPtr();
+    dMeter2Draw_c* itemHud = meter->getMeterDrawPtr();
+
+    // Map + the Items/Map button bar share this pass (both are in the same 640x480 logical space;
+    // see dusk::draw_lower_screen_buttons()'s doc comment) -- opened unconditionally so the
+    // buttons still show even on a frame where the map itself isn't ready yet (map == NULL).
+    if (aurora::gfx::create_pass(640, 480)) {
+        if (map != NULL) {
+            map->drawLowerScreen();
+        }
+        dusk::draw_lower_screen_buttons();
+        aurora::gfx::ResolvedTargets resolved;
+        aurora::gfx::resolve_pass(aurora::gfx::ResolveDesc{.color = true, .depth = false}, resolved);
+        aurora::gfx::set_second_surface_source(resolved.color);
+    }
+
+    if (itemHud != NULL) {
+        constexpr f32 kItemHudScale = 2.0f;
+        constexpr u32 kItemHudPassWidth = (u32)(640.0f / kItemHudScale);   // 320
+        constexpr u32 kItemHudPassHeight = (u32)(480.0f / kItemHudScale);  // 240
+        if (aurora::gfx::create_pass(kItemHudPassWidth, kItemHudPassHeight)) {
+            // itemHud->draw() is the same function used (and, when dual screen is active, skipped)
+            // for the old top-screen spot -- see dMeter2Draw_c::draw()'s own dual-screen check.
+            // The flag tells it "this call is the one that should actually draw."
+            dusk::set_drawing_lower_screen_content(true);
+            itemHud->draw();
+            dusk::set_drawing_lower_screen_content(false);
+            aurora::gfx::ResolvedTargets resolved;
+            aurora::gfx::resolve_pass(aurora::gfx::ResolveDesc{.color = true, .depth = false}, resolved);
+            aurora::gfx::set_second_surface_overlay_source(resolved.color);
+        }
+    }
+}
+#endif
+
 int mDoGph_Painter() {
     ZoneScoped;
 
@@ -2822,6 +2888,10 @@ int mDoGph_Painter() {
         GX_DEBUG_GROUP(dComIfGd_draw2DOpaTop);
         GX_DEBUG_GROUP(dComIfGd_draw2DXlu);
 
+        #if TARGET_PC
+        mDoGph_drawLowerScreen();
+        #endif
+
         if (dComIfGp_isPauseFlag()) {
             GX_DEBUG_GROUP(dComIfGp_particle_draw2Dfore, &draw_info3);
         }
@@ -2850,6 +2920,10 @@ int mDoGph_Painter() {
         dComIfGd_draw2DOpa();
         dComIfGd_draw2DOpaTop();
         dComIfGd_draw2DXlu();
+
+        #if TARGET_PC
+        mDoGph_drawLowerScreen();
+        #endif
     }
 
 #if TARGET_PC

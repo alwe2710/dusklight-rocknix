@@ -87,6 +87,14 @@ public:
     void keyCheck();
 
     virtual void draw();
+#if TARGET_PC
+    // Dual screen (ROCKNIX RG DS, Step 2): draws the minimap large and centered into whatever
+    // render pass is current (the caller is expected to have already redirected rendering to the
+    // lower-screen offscreen pass, see src/m_Do/m_Do_graphic.cpp). Always draws regardless of
+    // mMapIsInside/open-close state -- the point of the lower screen is a permanently-visible
+    // minimap, no show/hide toggle (see dusk::is_dual_screen_active() callers in this file).
+    void drawLowerScreen();
+#endif
     virtual ~dMeterMap_c();
 
     bool isDispPosInsideFlg() { return mMapIsInside != 0; }

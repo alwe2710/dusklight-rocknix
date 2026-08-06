@@ -17,8 +17,30 @@ index 50caa5a..886aeb1 100644
    void* iconRGBA8;
    uint32_t iconWidth;
    uint32_t iconHeight;
+diff --git a/include/aurora/gfx.hpp b/include/aurora/gfx.hpp
+index ac5e499..72101c8 100644
+--- a/include/aurora/gfx.hpp
++++ b/include/aurora/gfx.hpp
+@@ -160,4 +160,17 @@ uint32_t current_frame() noexcept;
+ /// code that registered draw types. Callable from the game thread only.
+ void synchronize();
+ 
++/// Dual screen (ROCKNIX RG DS, Step 2): call after resolve_pass() with the resulting
++/// ResolvedTargets::color to have that content presented on the second window/surface this
++/// frame (see webgpu::present_second_surface in gpu.cpp, invoked from aurora.cpp's end_frame).
++/// The view only needs to stay valid for the current frame, matching resolve_pass's own snapshot
++/// lifetime. Pass a null view to clear back to nothing (e.g. dual screen turned off mid-session).
++void set_second_surface_source(wgpu::TextureView view) noexcept;
++
++/// Same as set_second_surface_source, but composited on top of it (stretched to fill the second
++/// surface independently of the base layer's own resolution -- render at a smaller offscreen size
++/// to have it come out larger). Used for HUD elements that want their own scale factor distinct
++/// from the base layer (see dMeter2Draw_c::draw()'s item HUD in src/d/d_meter2_draw.cpp).
++void set_second_surface_overlay_source(wgpu::TextureView view) noexcept;
++
+ } // namespace aurora::gfx
 diff --git a/lib/aurora.cpp b/lib/aurora.cpp
-index 592306c..b309fe4 100644
+index 592306c..ff47686 100644
 --- a/lib/aurora.cpp
 +++ b/lib/aurora.cpp
 @@ -167,6 +167,21 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
@@ -43,19 +65,99 @@ index 592306c..b309fe4 100644
    gfx::initialize();
  
    imgui::create_context();
-@@ -405,6 +420,10 @@ void end_frame() noexcept {
+@@ -267,8 +282,20 @@ void end_frame() noexcept {
+   }
+ #endif
+ 
++  // Dual screen: read this frame's lower-screen content now, on the calling (game) thread, not
++  // from inside the deferred callback below -- that callback runs on the render worker thread,
++  // asynchronously relative to the game thread. gfx::get_second_surface_source() reads a plain
++  // global that begin_frame() resets at the start of every game-thread frame; reading it lazily
++  // from inside the callback raced against however many frames the game thread had already moved
++  // on to by the time the render worker actually got around to this one, so it only ever
++  // presented correctly by chance (observed on real hardware as the lower-screen content flashing
++  // for a frame or two instead of staying up). Capturing it by value here, the same way
++  // imguiDrawData/rmlBindGroup already are, ties it to *this* frame specifically.
++  wgpu::TextureView secondSurfaceSource = gfx::get_second_surface_source();
++  wgpu::TextureView secondSurfaceOverlaySource = gfx::get_second_surface_overlay_source();
++
+   gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
+-                  imguiDrawData = std::move(imguiDrawData)](
++                  imguiDrawData = std::move(imguiDrawData), secondSurfaceSource, secondSurfaceOverlaySource](
+                      wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks) {
+     wgpu::Texture currentTexture;
+     wgpu::TextureView currentView;
+@@ -405,6 +432,10 @@ void end_frame() noexcept {
      }
      gfx::after_submit();
  
 +    if (g_config.enableSecondWindow) {
-+      webgpu::present_second_surface_test_pattern();
++      webgpu::present_second_surface(secondSurfaceSource, secondSurfaceOverlaySource);
 +    }
 +
      TracyPlotConfig("aurora: lastVertSize", tracy::PlotFormatType::Memory, false, true, 0);
      TracyPlotConfig("aurora: lastUniformSize", tracy::PlotFormatType::Memory, false, true, 0);
      TracyPlotConfig("aurora: lastIndexSize", tracy::PlotFormatType::Memory, false, true, 0);
+diff --git a/lib/gfx/common.cpp b/lib/gfx/common.cpp
+index aa5b345..a68400e 100644
+--- a/lib/gfx/common.cpp
++++ b/lib/gfx/common.cpp
+@@ -1200,6 +1200,25 @@ bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out) {
+   return true;
+ }
+ 
++static wgpu::TextureView g_secondSurfaceSource;
++// Overlay layer composited on top of g_secondSurfaceSource at present time (see
++// webgpu::present_second_surface), stretched to fill the second surface independently of the
++// base layer's own size. Lets a caller render something at a smaller offscreen resolution and
++// have it come out larger on the lower screen -- see dMeter2Draw_c::draw()'s item HUD (A/B/X/Y/Z
++// prompts + D-pad), which wants a uniform 1.5x vs. the minimap's own 2x, without either affecting
++// the other or touching J2D's matrix/scale state.
++static wgpu::TextureView g_secondSurfaceOverlaySource;
++
++void set_second_surface_source(wgpu::TextureView view) noexcept { g_secondSurfaceSource = std::move(view); }
++
++wgpu::TextureView get_second_surface_source() noexcept { return g_secondSurfaceSource; }
++
++void set_second_surface_overlay_source(wgpu::TextureView view) noexcept {
++  g_secondSurfaceOverlaySource = std::move(view);
++}
++
++wgpu::TextureView get_second_surface_overlay_source() noexcept { return g_secondSurfaceOverlaySource; }
++
+ static void resume_efb_pass_loading(const RenderPass& prevPass) {
+   RenderPass newPass{
+       .label = pass_label("EFB"),
+@@ -1594,6 +1613,11 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
+ bool begin_frame() {
+   ZoneScoped;
+   // pace_frame_start();
++  // Dual screen: don't let a stale view from a previous frame linger if this frame's game code
++  // doesn't call set_second_surface_source() again (e.g. dual screen toggled off, or a scene
++  // that skips the 2D dispatch entirely) -- see get_second_surface_source() in aurora.cpp.
++  g_secondSurfaceSource = {};
++  g_secondSurfaceOverlaySource = {};
+   const size_t frameSlot = acquire_frame_slot();
+   const auto stagingSlot = acquire_mapped_staging_buffer();
+   if (!stagingSlot) {
+diff --git a/lib/gfx/common.hpp b/lib/gfx/common.hpp
+index b2c883c..57d7e41 100644
+--- a/lib/gfx/common.hpp
++++ b/lib/gfx/common.hpp
+@@ -259,6 +259,11 @@ void end_color_pass();
+ void queue_texture_copy(wgpu::TexelCopyTextureInfo src, wgpu::TexelCopyTextureInfo dst, wgpu::Extent3D size);
+ 
+ void begin_offscreen(uint32_t width, uint32_t height);
++// Internal counterpart to the public aurora::gfx::set_second_surface_source (aurora/gfx.hpp) --
++// consumed once per frame by aurora.cpp's end_frame, see webgpu::present_second_surface.
++wgpu::TextureView get_second_surface_source() noexcept;
++// Same, for aurora::gfx::set_second_surface_overlay_source.
++wgpu::TextureView get_second_surface_overlay_source() noexcept;
+ void end_offscreen();
+ bool is_offscreen() noexcept;
+ uint32_t get_sample_count() noexcept;
 diff --git a/lib/webgpu/gpu.cpp b/lib/webgpu/gpu.cpp
-index 3c4bcd9..721ec4b 100644
+index 3c4bcd9..82f5de6 100644
 --- a/lib/webgpu/gpu.cpp
 +++ b/lib/webgpu/gpu.cpp
 @@ -40,6 +40,7 @@ static Module Log("aurora::gpu");
@@ -66,26 +168,28 @@ index 3c4bcd9..721ec4b 100644
  wgpu::BackendType g_backendType;
  GraphicsConfig g_graphicsConfig;
  TextureWithSampler g_frameBuffer;
-@@ -61,6 +62,9 @@ static wgpu::Adapter g_adapter;
+@@ -61,6 +62,10 @@ static wgpu::Adapter g_adapter;
  wgpu::Instance g_instance;
  wgpu::AdapterInfo g_adapterInfo;
  static wgpu::SurfaceCapabilities g_surfaceCapabilities;
 +static wgpu::SurfaceCapabilities g_surfaceCapabilities2;
 +static wgpu::PresentMode g_secondSurfacePresentMode;
 +static bool g_secondSurfaceConfigured = false;
++static wgpu::Sampler g_secondSurfaceSampler;
  bool g_hasCoreFeatures = false;
  bool g_bcTexturesSupported = false;
  bool g_astcTexturesSupported = false;
-@@ -1059,6 +1063,8 @@ void shutdown() {
+@@ -1059,6 +1064,9 @@ void shutdown() {
    g_depthBuffer = {};
    g_queue = {};
    g_surface = {};
 +  g_surface2 = {};
 +  g_secondSurfaceConfigured = false;
++  g_secondSurfaceSampler = {};
    g_device = {};
    g_adapter = {};
    g_instance = {};
-@@ -1073,6 +1079,127 @@ void release_surface() noexcept {
+@@ -1073,6 +1081,192 @@ void release_surface() noexcept {
    }
  }
  
@@ -164,10 +268,27 @@ index 3c4bcd9..721ec4b 100644
 +  }
 +}
 +
-+void present_second_surface_test_pattern() {
++static wgpu::Sampler second_surface_sampler() {
++  if (!g_secondSurfaceSampler) {
++    const wgpu::SamplerDescriptor samplerDescriptor{
++        .label = "Second surface blit sampler",
++        .addressModeU = wgpu::AddressMode::ClampToEdge,
++        .addressModeV = wgpu::AddressMode::ClampToEdge,
++        .addressModeW = wgpu::AddressMode::ClampToEdge,
++        .magFilter = wgpu::FilterMode::Linear,
++        .minFilter = wgpu::FilterMode::Linear,
++        .mipmapFilter = wgpu::MipmapFilterMode::Linear,
++    };
++    g_secondSurfaceSampler = g_device.CreateSampler(&samplerDescriptor);
++  }
++  return g_secondSurfaceSampler;
++}
++
++void present_second_surface(wgpu::TextureView source, wgpu::TextureView overlaySource) {
 +  if (!g_secondSurfaceConfigured || !g_surface2 || !g_device) {
 +    return;
 +  }
++
 +  wgpu::SurfaceTexture surfaceTexture;
 +  {
 +    window::SurfaceLock surfaceLock;
@@ -178,25 +299,73 @@ index 3c4bcd9..721ec4b 100644
 +    return;
 +  }
 +  const auto view = surfaceTexture.texture.CreateView();
++
++  wgpu::BindGroup blitBindGroup;
++  if (source) {
++    const std::array bindGroupEntries{
++        wgpu::BindGroupEntry{.binding = 0, .sampler = second_surface_sampler()},
++        wgpu::BindGroupEntry{.binding = 1, .textureView = source},
++    };
++    const wgpu::BindGroupDescriptor bindGroupDescriptor{
++        .layout = g_CopyBindGroupLayout,
++        .entryCount = bindGroupEntries.size(),
++        .entries = bindGroupEntries.data(),
++    };
++    blitBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
++  }
++
++  wgpu::BindGroup overlayBindGroup;
++  if (overlaySource) {
++    const std::array bindGroupEntries{
++        wgpu::BindGroupEntry{.binding = 0, .sampler = second_surface_sampler()},
++        wgpu::BindGroupEntry{.binding = 1, .textureView = overlaySource},
++    };
++    const wgpu::BindGroupDescriptor bindGroupDescriptor{
++        .layout = g_CopyBindGroupLayout,
++        .entryCount = bindGroupEntries.size(),
++        .entries = bindGroupEntries.data(),
++    };
++    overlayBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
++  }
++
 +  const std::array attachments{
 +      wgpu::RenderPassColorAttachment{
 +          .view = view,
 +          .loadOp = wgpu::LoadOp::Clear,
 +          .storeOp = wgpu::StoreOp::Store,
-+          // Bright, unmissable test color (magenta) -- deliberately not a color that could be
-+          // confused with real content, since this is a Phase 1 "does the panel light up at all"
-+          // check, not a real render.
-+          .clearValue = wgpu::Color{1.0, 0.0, 1.0, 1.0},
++          // Plain neutral gray backdrop -- a proper background image is a separate topic to
++          // revisit later (see docs/rocknix-porting.md Section E), not a black test-pattern
++          // fallback like Phase 1's solid magenta, but not a real background asset either.
++          .clearValue = wgpu::Color{0.25, 0.25, 0.25, 1.0},
 +      },
 +  };
 +  const wgpu::RenderPassDescriptor renderPassDescriptor{
-+      .label = "Second surface test pattern",
++      .label = "Second surface present",
 +      .colorAttachmentCount = attachments.size(),
 +      .colorAttachments = attachments.data(),
 +  };
 +  const wgpu::CommandEncoderDescriptor encoderDescriptor{.label = "Second surface command encoder"};
 +  const auto encoder = g_device.CreateCommandEncoder(&encoderDescriptor);
 +  const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
++  if (blitBindGroup) {
++    // Premultiplied-alpha blended on top: the offscreen pass this came from
++    // (aurora::gfx::create_pass, see src/m_Do/m_Do_graphic.cpp) clears to fully transparent, so
++    // only the minimap picture itself is opaque -- everywhere else lets the background show
++    // through instead of stamping out an opaque black square over it.
++    pass.SetPipeline(g_CopyPremultipliedAlphaPipeline);
++    pass.SetBindGroup(0, blitBindGroup, 0, nullptr);
++    pass.Draw(3);
++  }
++  if (overlayBindGroup) {
++    // Same premultiplied-alpha blit as `source` above, but sampled from a texture that's usually
++    // smaller than the second surface -- the full-screen triangle stretches it to fill the panel,
++    // which is exactly what gives the overlay its own scale factor independent of `source` (see
++    // mDoGph_drawLowerScreen in src/m_Do/m_Do_graphic.cpp, which sizes the offscreen pass this
++    // came from to get a uniform 1.5x for the item HUD).
++    pass.SetPipeline(g_CopyPremultipliedAlphaPipeline);
++    pass.SetBindGroup(0, overlayBindGroup, 0, nullptr);
++    pass.Draw(3);
++  }
 +  pass.End();
 +  const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Second surface command buffer"};
 +  const auto buffer = encoder.Finish(&cmdBufDescriptor);
@@ -214,7 +383,7 @@ index 3c4bcd9..721ec4b 100644
                                        bool force) {
    if (!g_surface || !g_device || width == 0 || height == 0 || nativeHeight == 0 || nativeWidth == 0) {
 diff --git a/lib/webgpu/gpu.hpp b/lib/webgpu/gpu.hpp
-index 3943da0..409c6e7 100644
+index 3943da0..96bca1e 100644
 --- a/lib/webgpu/gpu.hpp
 +++ b/lib/webgpu/gpu.hpp
 @@ -42,6 +42,7 @@ struct Viewport {
@@ -225,20 +394,27 @@ index 3943da0..409c6e7 100644
  extern wgpu::BackendType g_backendType;
  extern GraphicsConfig g_graphicsConfig;
  extern TextureWithSampler g_frameBuffer;
-@@ -61,6 +62,16 @@ bool initialize(AuroraBackend backend, bool allowCpu);
+@@ -61,6 +62,23 @@ bool initialize(AuroraBackend backend, bool allowCpu);
  void shutdown();
  void release_surface() noexcept;
  bool refresh_surface(bool recreate = true);
 +
 +// Second surface for dual-screen devices, bound to window::get_second_sdl_window(). Independent
 +// of the primary surface's GraphicsConfig/framebuffer/depth-buffer machinery (see gpu.cpp) — this
-+// is only ever a bare clear-color target, not a full 3D render target, so it skips all of that.
-+// No-op / returns false if window::create_second_window() wasn't called (or failed) first.
++// is only ever a blit target (whatever's given to present_second_surface each frame), not a full
++// 3D render target, so it skips all of that. No-op / returns false if
++// window::create_second_window() wasn't called (or failed) first.
 +bool create_second_surface();
 +void release_second_surface() noexcept;
-+// Phase 1 proof-of-concept only: fills the second surface with a solid test color each frame.
-+// To be replaced once the second surface is proven reachable on real hardware.
-+void present_second_surface_test_pattern();
++// Blits `source` and, on top of it, `overlaySource` (both e.g. from gfx::resolve_pass, see
++// src/m_Do/m_Do_graphic.cpp) into the second surface for this frame, each independently stretched
++// to fill it -- so a smaller offscreen `overlaySource` comes out larger than `source` (see
++// dMeter2Draw_c::draw()'s item HUD, rendered at a reduced resolution for a uniform 1.5x vs. the
++// minimap's 2x). Either may be null and is skipped. The backdrop behind both is a plain neutral
++// gray for now, not a background image -- that's a separate topic to revisit later (see
++// docs/rocknix-porting.md Section E) -- so there's no null-image fallback to worry about either,
++// just Phase 1's solid-magenta test pattern being gone now that real content exists.
++void present_second_surface(wgpu::TextureView source, wgpu::TextureView overlaySource);
  void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight, bool force = false);
  TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled);
  const TextureWithSampler& present_source() noexcept;

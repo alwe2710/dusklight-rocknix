@@ -18,6 +18,7 @@
 #include "d/d_camera.h"
 #if TARGET_PC
 #include "dusk/settings.h"
+#include "dusk/dual_screen.hpp"
 #include <algorithm>
 #endif
 #include <cstring>
@@ -622,6 +623,13 @@ void dMeterMap_c::_draw() {
 }
 
 void dMeterMap_c::draw() {
+#if TARGET_PC
+    // Dual screen: the minimap moved to the lower panel (drawLowerScreen(), called separately
+    // from src/m_Do/m_Do_graphic.cpp) -- don't also draw it here in its old top-screen position.
+    if (dusk::is_dual_screen_active()) {
+        return;
+    }
+#endif
     if (
         #if DEBUG
         !g_meter_mapHIO.mMapDisplayProhibited &&
@@ -660,6 +668,46 @@ void dMeterMap_c::draw() {
         mMapJ2DPicture->calcMtx();
     }
 }
+
+#if TARGET_PC
+void dMeterMap_c::drawLowerScreen() {
+    if (mMap == NULL || !mMap->isDraw()) {
+        return;
+    }
+
+    J2DGrafContext* graf = dComIfGp_getCurrentGrafPort();
+    // setPort() (not just setup2D()) is deliberate here: this is a fresh offscreen pass, not a
+    // continuation of the normal top-screen 2D dispatch that already established a full-viewport
+    // scissor once via ortho.setPort() (m_Do_graphic.cpp) before any individual dlst draw() ran.
+    // Without resetting the scissor here too, it's whatever was left over from the last thing
+    // drawn in the normal pass just before this one starts, which may not overlap this draw at
+    // all -- the actual first symptom hit on real hardware was the minimap not appearing on
+    // either screen (top correctly suppressed, bottom silently clipped away).
+    graf->setPort();
+
+    // Centered on the lower panel, at a moderate 2x the map's own native draw size (96x96 or
+    // 144x144 depending on dungeon/overworld map type, see the sizeX/sizeY switch above).
+    // J2DPicture::draw() just stretches the source texture to fill whatever size is requested
+    // with no mip/high-quality filtering, so this is a real tradeoff, tuned against real-hardware
+    // feedback twice: native 1x was clear but reads as "tiny" on the panel; an earlier ~3x (fixed
+    // 300x300) was visibly blurry/blocky. 2x is a middle ground -- revisit if it still isn't
+    // enough. The offscreen pass this draws into is created at 640x480 physical pixels (see
+    // src/m_Do/m_Do_graphic.cpp), but J2D draw coordinates are in the shared grafport's logical
+    // space (640x456, same as the main screen) -- close enough to the panel's actual 640x480 that
+    // the ~5% vertical stretch when it's resolved onto the second surface isn't noticeable.
+    constexpr f32 kLowerScreenLogicalWidth = 640.0f;
+    constexpr f32 kLowerScreenLogicalHeight = 456.0f;
+    constexpr f32 kScale = 2.0f;
+    const f32 drawW = mSizeW * kScale;
+    const f32 drawH = mSizeH * kScale;
+    const f32 kPosX = (kLowerScreenLogicalWidth - drawW) * 0.5f;
+    const f32 kPosY = (kLowerScreenLogicalHeight - drawH) * 0.5f;
+
+    mMapJ2DPicture->setAlpha(0xFF);
+    mMapJ2DPicture->draw(kPosX, kPosY, drawW, drawH, false, false, false);
+    mMapJ2DPicture->calcMtx();
+}
+#endif
 
 void dMeterMap_c::ctrlShowMap() {
     int unused = 0;
@@ -765,6 +813,10 @@ void dMeterMap_c::ctrlShowMap() {
         } else if (!isEventRunCheck() &&
                    (dMeter2Info_getMapStatus() == 0 || dMeter2Info_getMapStatus() == 1) &&
                    isEnableDispMapAndMapDispSizeTypeNo() &&
+                   // Dual screen: the minimap is permanently visible on the lower panel (see
+                   // drawLowerScreen()), so the show/hide toggle no longer applies -- disabled
+                   // rather than deleted, so single-screen play (dual screen off) is unaffected.
+                   !dusk::is_dual_screen_active() &&
                    dusk::getActionBindTrig(dusk::ActionBinds::TOGGLE_MINIMAP, PAD_1))
         {
             if (isDispPosInsideFlg()) {

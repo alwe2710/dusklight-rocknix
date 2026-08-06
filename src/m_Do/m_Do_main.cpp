@@ -62,6 +62,7 @@
 #include "dusk/imgui/ImGuiEngine.hpp"
 #include "dusk/iso_validate.hpp"
 #include "dusk/logging.h"
+#include "dusk/lower_screen_touch.hpp"
 #include "dusk/main.h"
 #include "dusk/mod_loader.hpp"
 #include "dusk/mods/svc/window.hpp"
@@ -162,6 +163,9 @@ bool launchUILoop() {
                 if (dusk::mods::svc::window_dispatch_event(event->sdl)) {
                     break;
                 }
+                if (dusk::handle_lower_screen_touch_event(event->sdl)) {
+                    break;
+                }
                 dusk::mouse::handle_event(event->sdl);
                 dusk::ui::handle_event(event->sdl);
                 dusk::g_imguiConsole.HandleSDLEvent(event->sdl);
@@ -250,6 +254,9 @@ void main01(void) {
                 break;
             case AURORA_SDL_EVENT:
                 if (dusk::mods::svc::window_dispatch_event(event->sdl)) {
+                    break;
+                }
+                if (dusk::handle_lower_screen_touch_event(event->sdl)) {
                     break;
                 }
                 dusk::mouse::handle_event(event->sdl);

@@ -3120,7 +3120,15 @@ static int dMeter2_IsDelete(dMeter2_c* i_this) {
 }
 
 static int dMeter2_Delete(dMeter2_c* i_this) {
-    return i_this->_delete();
+    int ret = i_this->_delete();
+    // dMeter2_Create() sets this pointer on creation, but nothing cleared it back on deletion --
+    // a pre-existing asymmetry that was harmless as long as nothing read it once the process was
+    // gone. Dual screen's per-frame dMeter2Info_getMeterClass() (m_Do_graphic.cpp) is the first
+    // caller to do that, and hit exactly this: a stale pointer into freed process memory during
+    // scene transitions (real crash on hardware, dMeterMap_c::drawLowerScreen() dereferencing it
+    // while a new room's fpcNm_ROOM_SCENE_e was loading).
+    dMeter2Info_setMeterClass(NULL);
+    return ret;
 }
 
 static int dMeter2_Create(msg_class* i_this) {

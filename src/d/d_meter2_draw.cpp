@@ -20,6 +20,7 @@
 #include "d/d_msg_class.h"
 #include "d/d_msg_object.h"
 #include "d/d_pane_class.h"
+#include "dusk/dual_screen.hpp"
 #include "dusk/frame_interpolation.h"
 #include <cstring>
 
@@ -677,6 +678,17 @@ void dMeter2Draw_c::exec(u32 i_status) {
 }
 
 void dMeter2Draw_c::draw() {
+#if TARGET_PC
+    // Dual screen: this whole function -- item quick-select icons, A/B/X/Y/Z button prompts,
+    // kantera meter, pikari glow effects -- moved to the lower panel as one unit (see
+    // mDoGph_drawLowerScreen() in src/m_Do/m_Do_graphic.cpp, which calls this same draw() again
+    // with dusk::set_drawing_lower_screen_content(true) around it). Skip the normal top-screen
+    // call in that case; the "wie davor" positioning the relocation was asked to keep means not
+    // touching any of the coordinates below, only which pass they end up drawn into.
+    if (dusk::is_dual_screen_active() && !dusk::is_drawing_lower_screen_content()) {
+        return;
+    }
+#endif
     J2DGrafContext* graf_ctx = dComIfGp_getCurrentGrafPort();
     graf_ctx->setup2D();
 
@@ -1618,6 +1630,14 @@ void dMeter2Draw_c::drawLife(s16 i_maxLife, s16 i_life, f32 i_posX, f32 i_posY) 
 #if TARGET_PC
     f32 lifePosX = i_posX;
     f32 lifePosY = i_posY;
+    if (dusk::is_dual_screen_active()) {
+        // Dual screen (ROCKNIX): the top screen only carries hearts now (everything else moved
+        // to the lower screen), so nudge them further toward the corner instead of the single-
+        // screen default position, which left room for the HUD elements that used to share this
+        // screen.
+        lifePosX -= 20.0f;
+        lifePosY -= 15.0f;
+    }
     // The heart row sits inset from its box's left edge, so use a partial horizontal pull
     // to keep it from jamming against the screen edge.
     dAnchorHudScale(mpLifeParent, HudCorner::TopLeft, &lifePosX, &lifePosY, 0.6f);
@@ -2187,8 +2207,17 @@ void dMeter2Draw_c::drawRupee(s16 i_rupeeNum) {
 
     f32 rupeeKeyPosX = g_drawHIO.mRupeeKeyPosX;
     f32 rupeeKeyPosY = g_drawHIO.mRupeeKeyPosY;
-    // Rupees/keys read better anchored to the bottom-right corner than the top-right.
-    dAnchorHudScale(mpRupeeKeyParent, HudCorner::BottomRight, &rupeeKeyPosX, &rupeeKeyPosY);
+    if (dusk::is_dual_screen_active()) {
+        // Dual screen (ROCKNIX): bottom-left instead of the single-screen default bottom-right,
+        // to leave the bottom-right corner clear (item HUD/D-pad area). g_drawHIO.mRupeeKeyPosX
+        // is tuned for the right edge, so a small fixed left-edge margin stands in for it here
+        // rather than trying to mirror it exactly -- see docs/rocknix-porting.md Section E.
+        rupeeKeyPosX = 50.0f;
+        dAnchorHudScale(mpRupeeKeyParent, HudCorner::BottomLeft, &rupeeKeyPosX, &rupeeKeyPosY);
+    } else {
+        // Rupees/keys read better anchored to the bottom-right corner than the top-right.
+        dAnchorHudScale(mpRupeeKeyParent, HudCorner::BottomRight, &rupeeKeyPosX, &rupeeKeyPosY);
+    }
     mpRupeeKeyParent->paneTrans(rupeeKeyPosX, rupeeKeyPosY);
 #else
     mpRupeeKeyParent->scale(g_drawHIO.mRupeeKeyScale * field_0x718,

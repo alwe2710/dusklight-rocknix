@@ -12,6 +12,8 @@
 #include "ImGuiConsole.hpp"
 #include "ImGuiEngine.hpp"
 #include "JSystem/JUtility/JUTGamePad.h"
+#include "aurora/lib/input.hpp"
+#include <SDL3/SDL_filesystem.h>
 #include "dusk/action_bindings.h"
 #include "dusk/audio/DuskAudioSystem.h"
 #include "dusk/config.hpp"
@@ -270,7 +272,50 @@ namespace dusk {
                 m_isHidden = true;
             }
         }
-        
+
+        // Gamepad equivalent of Shift+F1, for devices with no keyboard (e.g. ROCKNIX handhelds) --
+        // hold L+R together. Edge-triggered on "both just became held" so it toggles once per
+        // hold, not every frame while held. (Originally L+R+Select, but Select/Back is already
+        // hardwired to open the Dusklight menu -- see SDL_GAMEPAD_BUTTON_BACK's handling in
+        // src/dusk/ui/input.cpp -- so that combo just opened that instead.) Didn't respond on
+        // real hardware either (get_controller_for_player(0) is presumably not resolving this
+        // device's built-in controls to an SDL gamepad instance) -- kept as a harmless no-op
+        // fallback, but see the file-based remote toggle right below for what's actually in use.
+        {
+            static bool sMenuComboHeldPrevFrame = false;
+            bool comboHeld = false;
+            if (aurora::input::GameController* controller = aurora::input::get_controller_for_player(0)) {
+                comboHeld = SDL_GetGamepadButton(controller->m_controller, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) &&
+                           SDL_GetGamepadButton(controller->m_controller, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER);
+            }
+            if (comboHeld && !sMenuComboHeldPrevFrame) {
+                if (getSettings().backend.enableAdvancedSettings) {
+                    m_isHidden = !m_isHidden;
+                } else {
+                    m_isHidden = true;
+                }
+            }
+            sMenuComboHeldPrevFrame = comboHeld;
+        }
+
+        // Remote/SSH-triggerable toggle for development on devices with no keyboard and where the
+        // gamepad combo above doesn't pan out either: `touch` this file over SSH (see
+        // docs/rocknix-porting.md Section E), checked (cheaply -- stat only) once per frame and
+        // removed again immediately so a single touch is a single toggle, not a toggle-per-frame
+        // for as long as the file happens to still exist.
+        {
+            static const char* kTogglePath = "/tmp/dusklight_toggle_debug_menu";
+            if (SDL_GetPathInfo(kTogglePath, nullptr)) {
+                SDL_RemovePath(kTogglePath);
+                // Unconditional toggle, unlike Shift+F1/the gamepad combo above: those only ever
+                // hide (never show) unless backend.enableAdvancedSettings is on, which it isn't
+                // here -- that's presumably meant to stop a regular player from fat-fingering the
+                // debug menu open, which doesn't apply to a toggle only reachable by deliberately
+                // touching a file over SSH in the first place.
+                m_isHidden = !m_isHidden;
+            }
+        }
+
         bool showMenu = !m_isHidden;
 
         // The menu bar renders with ImGuiCol_WindowBg behind it. We just want ImGuiCol_MenuBarBg,
@@ -364,6 +409,7 @@ namespace dusk {
             m_menuTools.ShowHeapOverlay();
             m_menuTools.ShowStubLog();
             m_menuTools.ShowBloomWindow();
+            m_menuTools.ShowLowerScreenButtonsWindow();
             m_menuTools.ShowPlayerInfo();
             m_menuTools.ShowAudioDebug();
             m_menuTools.ShowSaveEditor();

@@ -499,6 +499,107 @@ DraStic's single-window approach is not used here; recorded only because it's wh
 side-by-side hardware comparison surfaced along the way, including finding the working sway rule
 pattern.
 
+### Phase 2: actual HUD/minimap relocation + touch buttons
+
+Builds on Phase 1's second window/surface plumbing to do the real thing: minimap and item HUD
+(A/B/X/Y/Z prompts, D-pad indicator) render on the lower screen instead of the top, the old
+minimap show/hide keybind is gone (permanently visible now), hearts/life meter stay on top, and a
+new touch-driven button bar (Items/Map) sits along the lower screen's bottom edge. Also verified:
+on-device touch input actually works end-to-end for this, gamepad-combo/keyboard debug-menu
+toggles don't reach this hardware reliably, and a `dMeter2_c` dangling-pointer bug pre-dating dual
+screen entirely, exposed by being the first per-frame external caller into that class.
+
+**Rendering split.** `mDoGph_drawLowerScreen()` (`src/m_Do/m_Do_graphic.cpp`) opens up to two
+`aurora::gfx::create_pass()` offscreen passes per frame (never concurrently — nesting isn't
+supported) and hands each off to a separate `set_second_surface_source`/`_overlay_source` slot,
+composited together by `webgpu::present_second_surface()` (`extern/aurora/lib/webgpu/gpu.cpp`):
+one full 640x480 pass for the minimap (`dMeterMap_c::drawLowerScreen()`, 2x native size) plus the
+new button bar (`dusk::draw_lower_screen_buttons()`), and one smaller pass for the item HUD
+(`dMeter2Draw_c::draw()`, reused verbatim from its old top-screen call site via a
+`dusk::is_drawing_lower_screen_content()` flag) sized at 1/2 the panel resolution so the later
+blit-stretch gives it a uniform 2x scale independent of the minimap's own scale — rendering
+smaller-then-stretching turned out to be a cleaner way to get a per-layer scale factor than
+touching J2D matrix state, and doesn't care what "logical" ortho size J2D itself assumes.
+
+**Scissor bounds, not vertex position, was the real fix for content reaching the panel's edges.**
+Both the minimap and the button bar hit variations of the same bug: content stopping short of an
+edge no matter how far past it the vertex coordinates were pushed. Root cause, found while chasing
+why the button bar's "bottom overshoot" tuning slider visibly did nothing: `J2DGrafContext::setPort()`
+calls `setScissor()`, which clips to `mScissorBounds` on the *shared* grafport instance — whatever
+some other (top-screen-oriented) draw call last left it at, not this offscreen pass's own 640x480
+size. `GXSetViewport`/vertex position are irrelevant once the scissor test already excludes the
+pixels. Fix: `graf->place(JGeometry::TBox2<f32>(0, 0, 640, 480))` before drawing, restoring the
+saved previous bounds afterward so it doesn't leak into whatever draws next (top screen next
+frame, or the item HUD's own pass right after). See `dusk::draw_lower_screen_buttons()` for the
+current instance of this fix; `dMeterMap_c::drawLowerScreen()` predates it and uses a fixed
+`kLowerScreenLogicalHeight = 456` constant instead (works, but is the same underlying issue papered
+over with a magic number rather than fixed at the source — worth reconciling later).
+
+**J2DTextBox: two concurrent instances silently drop the second draw.** Two separate
+`J2DTextBox` instances (one per button label) resulted in only the first ever rendering — no
+error, no crash, just absent. Never root-caused at the J2DPrint/font level; fixed pragmatically by
+reusing one `J2DTextBox` instance sequentially (`setString`+`draw` for "Items", then again for
+"Karte") instead of keeping two alive at once, which is also just less code. `draw(x, y, w,
+HBIND_CENTER)` centers text *within* the box `[x, x+w]` — `x` needs to be the box's left edge, not
+an already-centered midpoint; passing the midpoint (an early mistake here) double-centers it.
+
+**Touch hardware, confirmed on-device (`/proc/bus/input/devices`, raw evdev capture on
+`/dev/input/eventN`, `swaymsg -t get_inputs`):** the RG DS's two panels are driven by **two
+independent Goodix capacitive touch controllers** (different I2C busses, `fe5c0000.i2c` vs.
+`fe5e0000.i2c`) that report an *identical* libinput identifier (`1046:911:Goodix_Capacitive_TouchScreen`,
+same vendor/product/name) — sway `input "<identifier>"` config rules can't target one and not the
+other by that name alone. ROCKNIX already ships each one with its own `calibration_matrix`
+(`swaymsg -t get_inputs`) mapping its normalized touch range onto its own half of the compositor's
+combined virtual desktop (`[0.5,0,0.5,...]` vs. `[0.5,0,0,...]`, i.e. x-range 0.5-1.0 vs. 0-0.5 of
+the 1280-wide combined layout) — so no `map_to_output` override was needed at all; SDL3's
+`SDL_TouchFingerEvent::windowID` (new vs. SDL2) already scopes each touch to the correct Aurora
+window automatically once each panel's touch device is calibrated to its own half, which it
+already was by default. Verified by capturing raw evdev events while tapping each screen once and
+correlating device node to timestamp order.
+
+**Debug-menu access on this hardware didn't work as assumed.** The existing Shift+F1 hotkey (menu
+bar toggle, `ImGuiConsole.cpp`) needs a keyboard, which the RG DS doesn't have for normal play. A
+gamepad L+R (+ originally Select, dropped — Select/Back is hardwired to open Dusklight's own
+in-game menu regardless of any other combo held, see `SDL_GAMEPAD_BUTTON_BACK` handling in
+`src/dusk/ui/input.cpp`) combo was added as a fallback but never actually toggled anything on real
+hardware either (`aurora::input::get_controller_for_player(0)` most likely isn't resolving this
+device's built-in controls to an SDL gamepad instance — not confirmed further, deprioritized once
+the fallback below covered the actual need). What's actually in use: a file-based remote trigger —
+`touch /tmp/dusklight_toggle_debug_menu` over SSH, polled (stat only) once per frame and removed
+again immediately. Also had to bypass `backend.enableAdvancedSettings` for this specific path
+specifically: Shift+F1 and the gamepad combo both only ever *hide* the menu (never show it) unless
+that setting is on, presumably to stop a regular player from fat-fingering the debug menu open —
+a restriction that doesn't apply to a toggle only reachable by deliberately touching a file over
+SSH in the first place.
+
+**Pre-existing dangling-pointer bug, exposed (not caused) by dual screen.** `dMeter2_Create()`
+sets a global (`dMeter2Info_setMeterClass`), but nothing ever cleared it — `dMeter2_Delete()` just
+called `_delete()`. Dual screen's `mDoGph_drawLowerScreen()` is the first code that reads that
+global every frame from *outside* `dMeter2_c` itself, so it's the first thing to actually dereference
+the dangling pointer during a scene transition (`SIGSEGV` inside `dMeterMap_c::drawLowerScreen()`).
+Fixed with a one-line addition to `dMeter2_Delete()` (`src/d/d_meter2.cpp`):
+`dMeter2Info_setMeterClass(NULL);` after `_delete()`.
+
+**Live tuning instead of rebuild/redeploy per pixel.** The button bar's layout/color/font values
+(`dusk::LowerScreenButtonTuning`, `src/dusk/lower_screen_touch.hpp`) are runtime-mutable and bound
+to an ImGui debug window (`src/dusk/imgui/ImGuiLowerScreenButtonsWindow.cpp`, "Debug → Lower Screen
+Buttons") rather than compile-time constants, once it became clear several rounds of guess-build-
+deploy-screenshot were needed to get position/size right by feel on the actual hardware.
+`handle_lower_screen_touch_event()`'s hit-testing and `draw_lower_screen_buttons()`'s rendering both
+read the same live `LowerScreenButtonTuning&` instance, so the tap zone can't drift from what's
+actually drawn.
+
+**Not yet done:** the button bar is currently just colored rectangles + labels + touch-press
+highlight (Stage 1 of the plan) — tapping either logs, nothing else yet. Map is meant to pause and
+open the existing big-map screen redirected to the lower panel with full touch control (pan/zoom/
+waypoints); Items is meant to open a touch drag-and-drop screen reusing the existing X/Y item-slot
+data (`dComIfGs_setSelectItemIndex(int i_no, u8 item_index)`, `i_no` 0/1 for X/Y — the same backend
+the classic item-select ring already calls) with a custom UI instead of the ring. A lower-screen
+background image (something other than flat gray) is also an open question — the in-game pause
+menu's own background is a live darkened capture of the current scene
+(`dDlst_MENU_CAPTURE_c`, `src/d/d_menu_window.cpp`), not a standalone asset, so there's no simple
+file to point at instead; parked pending a clearer answer on what's actually wanted there.
+
 ### Status
 
 Phase 1 confirmed working on real hardware: the second window/surface reaches the physical lower

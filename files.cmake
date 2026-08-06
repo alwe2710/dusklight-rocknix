@@ -1434,6 +1434,8 @@ set(DUSK_FILES
         src/dusk/discord.cpp
         src/dusk/discord.hpp
         src/dusk/discord_presence.cpp
+        src/dusk/dual_screen.cpp
+        src/dusk/dual_screen.hpp
         src/dusk/dvd_asset.cpp
         src/dusk/dvd_asset.hpp
         src/dusk/extras.c
@@ -1456,6 +1458,8 @@ set(DUSK_FILES
         src/dusk/imgui/ImGuiEngine.cpp
         src/dusk/imgui/ImGuiEngine.hpp
         src/dusk/imgui/ImGuiHeapOverlay.cpp
+        src/dusk/imgui/ImGuiLowerScreenButtonsWindow.cpp
+        src/dusk/imgui/ImGuiLowerScreenButtonsWindow.hpp
         src/dusk/imgui/ImGuiMenuTools.cpp
         src/dusk/imgui/ImGuiMenuTools.hpp
         src/dusk/imgui/ImGuiProcessOverlay.cpp
@@ -1468,6 +1472,8 @@ set(DUSK_FILES
         src/dusk/layout.cpp
         src/dusk/livesplit.cpp
         src/dusk/logging.cpp
+        src/dusk/lower_screen_touch.cpp
+        src/dusk/lower_screen_touch.hpp
         src/dusk/menu_pointer.cpp
         src/dusk/menu_pointer.h
         src/dusk/mods/loader/bundle_disk.cpp
